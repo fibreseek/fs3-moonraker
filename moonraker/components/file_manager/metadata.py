@@ -126,7 +126,7 @@ def regex_find_max_float(pattern: str, data: str) -> Optional[float]:
 
 # Slicer parsing implementations
 class BaseSlicer(object):
-    def __init__(self, file_path: str) -> None:
+    def __init__(self, file_path: str, thumbs_dir: Optional[str] = None) -> None:
         self.path = file_path
         self.slicer_name = "Unknown"
         self.slicer_version = "?"
@@ -134,6 +134,7 @@ class BaseSlicer(object):
         self.footer_data: str = ""
         self.layer_height: Optional[float] = None
         self.has_m486_objects: bool = False
+        self.thumbs_dir = thumbs_dir
 
     def set_data(self,
                  header_data: str,
@@ -262,7 +263,8 @@ class BaseSlicer(object):
                 break
         else:
             return None
-        thumb_dir = os.path.join(os.path.dirname(self.path), ".thumbs")
+        # thumb_dir = os.path.join(os.path.dirname(self.path), ".thumbs")
+        thumb_dir = self.thumbs_dir or os.path.join(os.path.dirname(self.path), ".thumbs")
         if not os.path.exists(thumb_dir):
             try:
                 os.mkdir(thumb_dir)
@@ -288,13 +290,17 @@ class BaseSlicer(object):
                 continue
             thumb_name = f"{thumb_base}-{info[0]}x{info[1]}.png"
             thumb_path = os.path.join(thumb_dir, thumb_name)
-            rel_thumb_path = os.path.join(".thumbs", thumb_name)
+            if self.thumbs_dir:
+                rel_thumb_path = os.path.join(self.thumbs_dir, thumb_name)
+            else:
+                rel_thumb_path = os.path.join(".thumbs", thumb_name)
             with open(thumb_path, "wb") as f:
                 f.write(base64.b64decode(data.encode()))
             parsed_matches.append({
                 'width': info[0], 'height': info[1],
                 'size': os.path.getsize(thumb_path),
-                'relative_path': rel_thumb_path})
+                'relative_path': rel_thumb_path,
+                'absolute_path': os.path.abspath(thumb_path)})
             if info[0] == 32 and info[1] == 32:
                 has_miniature = True
         if len(parsed_matches) > 0 and not has_miniature:
@@ -306,7 +312,10 @@ class BaseSlicer(object):
             # Create miniature thumbnail if one does not exist
             thumb_full_name = largest_match['relative_path'].split("/")[-1]
             thumb_path = os.path.join(thumb_dir, f"{thumb_full_name}")
-            rel_path_small = os.path.join(".thumbs", f"{thumb_base}-32x32.png")
+            if self.thumbs_dir:
+                rel_path_small = os.path.join(self.thumbs_dir, f"{thumb_base}-32x32.png")
+            else:
+                rel_path_small = os.path.join(".thumbs", f"{thumb_base}-32x32.png")
             thumb_path_small = os.path.join(
                 thumb_dir, f"{thumb_base}-32x32.png")
             # read file
@@ -318,7 +327,8 @@ class BaseSlicer(object):
                     parsed_matches.insert(0, {
                         'width': im.width, 'height': im.height,
                         'size': os.path.getsize(thumb_path_small),
-                        'relative_path': rel_path_small
+                        'relative_path': rel_path_small,
+                        'absolute_path': os.path.abspath(thumb_path_small)
                     })
             except Exception as e:
                 logger.info(str(e))
@@ -651,7 +661,8 @@ class Cura(BaseSlicer):
                 thumbs.append({
                     'width': im.width, 'height': im.height,
                     'size': os.path.getsize(thumb_path),
-                    'relative_path': rel_path_full
+                    'relative_path': rel_path_full,
+                    'absolute_path': os.path.abspath(thumb_path)
                 })
                 # Create 32x32 thumbnail
                 im.thumbnail((32, 32), Image.Resampling.LANCZOS)
@@ -659,7 +670,8 @@ class Cura(BaseSlicer):
                 thumbs.insert(0, {
                     'width': im.width, 'height': im.height,
                     'size': os.path.getsize(thumb_path_small),
-                    'relative_path': rel_path_small
+                    'relative_path': rel_path_small,
+                    'absolute_path': os.path.abspath(thumb_path_small)
                 })
         except Exception as e:
             logger.info(str(e))
@@ -1109,7 +1121,7 @@ def process_objects(file_path: str, slicer: BaseSlicer) -> bool:
         shutil.move(tmp_file, file_path)
     return True
 
-def get_slicer(file_path: str) -> BaseSlicer:
+def get_slicer(file_path: str, thumbs_dir: Optional[str] = None) -> BaseSlicer:
     header_data = footer_data = ""
     slicer: Optional[BaseSlicer] = None
     size = os.path.getsize(file_path)
@@ -1118,7 +1130,7 @@ def get_slicer(file_path: str) -> BaseSlicer:
         # identify the slicer
         header_data = f.read(READ_SIZE)
         for impl in SUPPORTED_SLICERS:
-            slicer = impl(file_path)
+            slicer = impl(file_path, thumbs_dir)
             if slicer.check_identity(header_data):
                 break
         else:
@@ -1202,15 +1214,15 @@ def run_gcode_processors(
     return finished_procs, reload_slicer_data
 
 def extract_metadata(
-    file_path: str, processors: List[Dict[str, Any]]
+    file_path: str, processors: List[Dict[str, Any]], thumbs_dir: Optional[str] = None
 ) -> Dict[str, Any]:
     metadata: Dict[str, Any] = {}
     proc_list: List[str] = []
-    slicer = get_slicer(file_path)
+    slicer = get_slicer(file_path, thumbs_dir)
     if processors:
         proc_list, reload = run_gcode_processors(file_path, slicer, processors)
         if reload:
-            slicer = get_slicer(file_path)
+            slicer = get_slicer(file_path, thumbs_dir)
     metadata["size"] = os.path.getsize(file_path)
     metadata["modified"] = os.path.getmtime(file_path)
     metadata["uuid"] = str(uuid.uuid4())
@@ -1260,6 +1272,7 @@ def main(config: Dict[str, Any]) -> None:
     gc_path: str = config["gcode_dir"]
     filename: str = config["filename"]
     file_path = os.path.join(gc_path, filename)
+    thumbs_dir = config.get("thumbs_dir", "")
     processors: List[Dict[str, Any]] = config.get("processors", [])
     processors.append(
         {
@@ -1280,7 +1293,7 @@ def main(config: Dict[str, Any]) -> None:
         logger.info(f"File Not Found: {file_path}")
         sys.exit(-1)
     try:
-        metadata = extract_metadata(file_path, processors)
+        metadata = extract_metadata(file_path, processors, thumbs_dir)
     except Exception:
         logger.info(traceback.format_exc())
         sys.exit(-1)

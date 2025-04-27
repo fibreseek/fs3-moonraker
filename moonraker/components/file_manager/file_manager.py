@@ -139,6 +139,9 @@ class FileManager:
             "/server/files/delete_file", RequestType.DELETE, self._handle_file_delete,
             transports=TransportType.WEBSOCKET
         )
+        self.server.register_endpoint(
+            "/server/files/metascanusb", RequestType.POST, self._handle_metascanusb_request
+        )
         # register client notificaitons
         self.server.register_notification("file_manager:filelist_changed")
 
@@ -175,6 +178,13 @@ class FileManager:
                     prune = False
             if prune:
                 self.gcode_metadata.prune_storage()
+
+        usb_mount_path = "/media"
+        if os.path.exists(usb_mount_path):
+            self.register_directory("usb", usb_mount_path, full_access=True)
+            logging.info(f"USB root directory registered at {usb_mount_path}")
+        else:
+            logging.warning(f"USB mount path {usb_mount_path} does not exist")
 
     def start_file_observer(self):
         self.fs_observer.initialize()
@@ -456,6 +466,74 @@ class FileManager:
                     f"Failed to parse metadata for file '{requested_file}'", 500)
             metadata['filename'] = requested_file
             return metadata
+    
+    async def _handle_metascanusb_request(
+        self, web_request: WebRequest
+    ) -> Dict[str, Any]:
+        """
+        临时获取USB gcode文件的metadata，不写入MetadataStorage缓存
+        参数:
+            filename: USB根目录下的gcode文件相对路径
+            usb: USB根目录的相对路径
+        """
+        requested_file: str = web_request.get_str('filename')
+        usb_root = self.get_directory("usb")
+        file_path = pathlib.Path(usb_root).joinpath(requested_file)
+        if not file_path.is_file():
+            raise self.server.error(f"File '{requested_file}' does not exist on USB", 404)
+        ext = file_path.suffix.lower()
+        if ext not in VALID_GCODE_EXTS:
+            raise self.server.error(f"File {file_path} is not a valid gcode file")
+        # 构造 path_info
+        path_info = self.get_path_info(file_path, "gcodes", raise_error=False)
+        # 直接调用 MetadataStorage 的 _run_extract_metadata，不写入缓存
+        gcode_metadata: MetadataStorage = self.gcode_metadata
+        try:
+            # 复用_metadata的配置生成逻辑
+            config: Dict[str, Any] = {
+                "filename": requested_file,
+                "gcode_dir": usb_root,
+                "check_objects": gcode_metadata.enable_object_proc,
+                "ufp_path": path_info.get('ufp_path', None),
+                "processors": list(gcode_metadata.processors.values()),
+                "thumbs_dir": "/tmp/usb_thumbs" 
+            }
+            timeout = gcode_metadata.default_metadata_parser_timeout
+            if config["ufp_path"] is not None or config["check_objects"]:
+                timeout = max(timeout, 300.)
+            if gcode_metadata.processors:
+                proc_timeout = sum(
+                    [proc.get("timeout", 0) for proc in gcode_metadata.processors.values()]
+                )
+                timeout = max(timeout, proc_timeout)
+            eventloop = self.server.get_event_loop()
+            md_cfg = await eventloop.run_in_thread(gcode_metadata._create_metadata_cfg, config)
+            cmd = " ".join([sys.executable, METADATA_SCRIPT, "-c", shlex.quote(md_cfg)])
+            result = bytearray()
+            try:
+                sc: SCMDComp = self.server.lookup_component('shell_command')
+                scmd = sc.build_shell_command(
+                    cmd, callback=result.extend, log_stderr=True
+                )
+                if not await scmd.run(timeout=timeout):
+                    raise self.server.error("Extract Metadata returned with error")
+            finally:
+                def _rm_md_config():
+                    with contextlib.suppress(OSError):
+                        os.remove(md_cfg)
+                await eventloop.run_in_thread(_rm_md_config)
+            try:
+                decoded_resp: Dict[str, Any] = jsonw.loads(result.strip())
+            except Exception:
+                logging.debug(f"Invalid metadata response:\n{result}")
+                raise self.server.error("Unable to extract metadata")
+            metadata: Dict[str, Any] = decoded_resp.get('metadata', {})
+            if not metadata:
+                raise self.server.error("Unable to extract metadata")
+            metadata.update({'filename': requested_file})
+            return metadata
+        except Exception as e:
+            raise self.server.error(f"Failed to parse metadata for USB file '{requested_file}': {e}", 500)
 
     async def _handle_list_roots(
         self, web_request: WebRequest
