@@ -251,6 +251,9 @@ class BaseSlicer(object):
 
     def parse_first_layer_extr_temp(self) -> Optional[float]:
         return None
+    
+    def parse_first_layer_extr_temp1(self) -> Optional[float]:
+        return None
 
     def parse_filament_change_count(self) -> Optional[int]:
         return None
@@ -338,6 +341,39 @@ class BaseSlicer(object):
         return None
 
     def parse_nozzle_diameter(self) -> Optional[float]:
+        return None
+    
+    def parse_nozzle_diameter1(self) -> Optional[float]:
+        return None
+    
+    def parse_p0_filament_length_total(self) -> Optional[float]:
+        return None
+    
+    def parse_f0_filament_length_total(self) -> Optional[float]:
+        return None
+    
+    def parse_p1_filament_length_total(self) -> Optional[float]:
+        return None
+    
+    def parse_p0_filament_weight_total(self) -> Optional[float]:
+        return None
+    
+    def parse_f0_filament_weight_total(self) -> Optional[float]:
+        return None
+    
+    def parse_p1_filament_weight_total(self) -> Optional[float]:
+        return None
+    
+    def parse_p0_filament_name(self) -> Optional[str]:
+        return None
+    
+    def parse_f0_filament_name(self) -> Optional[str]:
+        return None
+    
+    def parse_p1_filament_name(self) -> Optional[str]:
+        return None
+    
+    def parse_print_mode(self) -> Optional[str]:
         return None
 
 class UnknownSlicer(BaseSlicer):
@@ -836,7 +872,6 @@ class KISSlicer(BaseSlicer):
     def parse_chamber_temp(self) -> Optional[float]:
         return regex_find_float(r"; chamber_C = (%F)", self.header_data)
 
-
 class IdeaMaker(BaseSlicer):
     def check_identity(self, data: str) -> bool:
         match = re.search(r"\sideaMaker\s(.*),", data)
@@ -1037,11 +1072,194 @@ class KiriMoto(BaseSlicer):
             r"; firstLayerBedTemp = (%F)", self.header_data
         )
 
+class AuraSlicer(BaseSlicer):
+    def check_identity(self, data: str) -> bool:
+        match = re.search(r"Anisoprint Aura v?([0-9\.]+)\s+on", data)
+        if match:
+            self.slicer_name = "Aura"
+            self.slicer_version = match.group(1)
+            return True
+        return False
+    
+    def _parse_printinfo_json(self):
+        match = re.search(r';PRINTINFO:({.*})', self.footer_data)
+        if not match:
+            return None
+        try:
+            info = json.loads(match.group(1))
+            return info
+        except Exception:
+            logger.info("Failed to parse PRINTINFO json")
+            return None
+        
+    def parse_p0_filament_length_total(self) -> Optional[float]:
+        info = self._parse_printinfo_json()
+        if not info or "extruders" not in info:
+            return None
+        extr = info["extruders"].get("0")
+        if extr:
+            p = extr.get("p")
+            if p and "length" in p:
+                return float(p["length"])
+        return None
+    
+    def parse_f0_filament_length_total(self) -> Optional[float]:
+        info = self._parse_printinfo_json()
+        if not info or "extruders" not in info:
+            return None
+        extr = info["extruders"].get("0")
+        if extr:
+            f = extr.get("f")
+            if f and "length" in f:
+                return float(f["length"])
+        return None
+    
+    def parse_p1_filament_length_total(self) -> Optional[float]:
+        info = self._parse_printinfo_json()
+        if not info or "extruders" not in info:
+            return None
+        extr = info["extruders"].get("1")
+        if extr:
+            p = extr.get("p")
+            if p and "length" in p:
+                return float(p["length"])
+        return None
+    
+    def parse_p0_filament_weight_total(self) -> Optional[float]:
+        info = self._parse_printinfo_json()
+        if not info or "extruders" not in info:
+            return None
+        extr = info["extruders"].get("0")
+        if extr:
+            p = extr.get("p")
+            if p and "weight" in p:
+                return float(p["weight"])
+        return None
+    
+    def parse_f0_filament_weight_total(self) -> Optional[float]:
+        info = self._parse_printinfo_json()
+        if not info or "extruders" not in info:
+            return None
+        extr = info["extruders"].get("0")
+        if extr:
+            f = extr.get("f")
+            if f and "weight" in f:
+                return float(f["weight"])
+        return None
+    
+    def parse_p1_filament_weight_total(self) -> Optional[float]:
+        info = self._parse_printinfo_json()
+        if not info or "extruders" not in info:
+            return None
+        extr = info["extruders"].get("1")
+        if extr:
+            p = extr.get("p")
+            if p and "weight" in p:
+                return float(p["weight"])
+        return None
+    
+    def parse_p0_filament_name(self) -> Optional[str]:
+        info = self._parse_printinfo_json()
+        if not info or "extruders" not in info:
+            return None
+        extr = info["extruders"].get("0")
+        if extr:
+            p = extr.get("p")
+            if p and "name" in p:
+                return str(p["name"])
+        return None
+    
+    def parse_f0_filament_name(self) -> Optional[str]:
+        info = self._parse_printinfo_json()
+        if not info or "extruders" not in info:
+            return None
+        extr = info["extruders"].get("0")
+        if extr:
+            f = extr.get("f")
+            if f and "name" in f:
+                return str(f["name"])
+        return None
+    
+    def parse_p1_filament_name(self) -> Optional[str]:
+        info = self._parse_printinfo_json()
+        if not info or "extruders" not in info:
+            return None
+        extr = info["extruders"].get("1")
+        if extr:
+            p = extr.get("p")
+            if p and "name" in p:
+                return str(p["name"])
+        return None
 
+    def parse_estimated_time(self) -> Optional[float]:
+        info = self._parse_printinfo_json()
+        if not info or "time" not in info:
+            return None
+        return float(info["time"])
+    
+    def parse_layer_count(self) -> Optional[int]:
+        info = self._parse_printinfo_json()
+        if "model" in info and "total_layer" in info["model"]:
+            return int(info["model"]["total_layer"])
+        return None
+    
+    def parse_layer_height(self) -> Optional[float]:
+        info = self._parse_printinfo_json()
+        if "model" in info and "object_layer" in info["model"]:
+            return float(info["model"]["object_layer"])
+        return None
+    
+    # left extruder diameter
+    def parse_nozzle_diameter(self) -> Optional[float]:
+        info = self._parse_printinfo_json()
+        if "extruders" in info and "0" in info["extruders"]:
+            extr = info["extruders"]["0"]
+            if "nozzle_diameter" in extr:
+                return float(extr["nozzle_diameter"])
+        return None
+    
+    # right extruder diameter
+    def parse_nozzle_diameter1(self) -> Optional[float]:
+        info = self._parse_printinfo_json()
+        if "extruders" in info and "1" in info["extruders"]:
+            extr = info["extruders"]["1"]
+            if "nozzle_diameter" in extr:
+                return float(extr["nozzle_diameter"])
+        return None
+    
+    def parse_object_height(self) -> Optional[float]:
+        info = self._parse_printinfo_json()
+        if "model" in info and "object_height" in info["model"]:
+            return float(info["model"]["object_height"])
+        return None
+    
+    def parse_print_mode(self) -> Optional[str]:
+        match = re.search(r";\s*PRINTING_MODE:\s*(.+)", self.header_data)
+        if match:
+            return match.group(1).strip()
+        return None
+    
+    # left extruder temperature
+    def parse_first_layer_extr_temp(self) -> Optional[float]:
+        temp = regex_find_float(r"M109 T0 S(%F)", self.header_data)
+        if temp is not None:
+            return temp
+        return regex_find_float(r"M109 S(%F) T0", self.header_data)
+    
+    # right extruder temperature
+    def parse_first_layer_extr_temp1(self) -> Optional[float]:
+        temp = regex_find_float(r"M109 T1 S(%F)", self.header_data)
+        if temp is not None:
+            return temp
+        return regex_find_float(r"M109 S(%F) T1", self.header_data)
+
+    def parse_first_layer_bed_temp(self) -> Optional[float]:
+        return regex_find_float(r"M190 S(%F)", self.header_data)
+    
 READ_SIZE = 1024 * 1024  # 1 MiB
 SUPPORTED_SLICERS: List[Type[BaseSlicer]] = [
     PrusaSlicer, Slic3rPE, Slic3r, Cura, Simplify3D,
-    KISSlicer, IdeaMaker, IceSL, KiriMoto
+    KISSlicer, IdeaMaker, IceSL, KiriMoto, AuraSlicer
 ]
 SUPPORTED_DATA = [
     'gcode_start_byte',
@@ -1066,7 +1284,25 @@ SUPPORTED_DATA = [
     'filament_total',
     'filament_weight_total',
     'filament_weights',
-    'thumbnails'
+    'thumbnails',
+    'p0_filament_length_total',
+    'p0_filament_weight_total',
+    'p0_filament_name',
+    # 'p0_filament_type',
+    # 'p0_filament_color',
+    'f0_filament_length_total',
+    'f0_filament_weight_total',
+    'f0_filament_name',
+    # 'f0_filament_type',
+    # 'f0_filament_color',
+    'p1_filament_length_total',
+    'p1_filament_weight_total',
+    'p1_filament_name',
+    # 'p1_filament_type',
+    # 'p1_filament_color',
+    'print_mode',
+    'first_layer_extr_temp1',
+    'nozzle_diameter1',
 ]
 
 PPC_REGEX = (

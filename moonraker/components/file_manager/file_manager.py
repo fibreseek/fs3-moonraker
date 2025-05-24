@@ -179,7 +179,7 @@ class FileManager:
             if prune:
                 self.gcode_metadata.prune_storage()
 
-        usb_mount_path = "/media"
+        usb_mount_path = "/media/anisoprint"
         if os.path.exists(usb_mount_path):
             self.register_directory("usb", usb_mount_path, full_access=True)
             logging.info(f"USB root directory registered at {usb_mount_path}")
@@ -831,21 +831,22 @@ class FileManager:
             if not os.path.exists(full_path):
                 continue
             path_info = self.get_path_info(full_path, root)
+            # Skip hidden directories (starting with .) and "System Volume Information"
             if os.path.isdir(full_path):
+                if fname.startswith(".") or fname.startswith("System Volume"):
+                    continue
                 path_info['dirname'] = fname
                 flist['dirs'].append(path_info)
             elif os.path.isfile(full_path):
+                ext = os.path.splitext(fname)[-1].lower()
+                if ext not in VALID_GCODE_EXTS:
+                    continue
                 path_info['filename'] = fname
                 # Check to see if a filelist update is necessary
-                ext = os.path.splitext(fname)[-1].lower()
-                if (
-                    root == "gcodes" and
-                    ext in VALID_GCODE_EXTS and
-                    is_extended
-                ):
+                if (root == "gcodes" and ext in VALID_GCODE_EXTS and is_extended):
+                    # 如果请求参数 extended=True，则将元数据(metadata)合并到文件信息中
                     rel_path = self.get_relative_path(root, full_path)
-                    metadata: Dict[str, Any] = self.gcode_metadata.get(
-                        rel_path, {})
+                    metadata: Dict[str, Any] = self.gcode_metadata.get(rel_path, {})
                     path_info.update(metadata)
                 flist['files'].append(path_info)
         usage = shutil.disk_usage(path)
