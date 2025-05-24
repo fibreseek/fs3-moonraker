@@ -839,7 +839,7 @@ class FileManager:
                 flist['dirs'].append(path_info)
             elif os.path.isfile(full_path):
                 ext = os.path.splitext(fname)[-1].lower()
-                if ext not in VALID_GCODE_EXTS:
+                if (root == "gcodes" or root == "usb") and ext not in VALID_GCODE_EXTS:
                     continue
                 path_info['filename'] = fname
                 # Check to see if a filelist update is necessary
