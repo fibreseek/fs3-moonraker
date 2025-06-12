@@ -1082,7 +1082,7 @@ class AuraSlicer(BaseSlicer):
         return False
     
     def _parse_printinfo_json(self):
-        match = re.search(r';PRINTINFO:({.*})', self.footer_data)
+        match = re.search(r'; PRINTINFO: ({.*})', self.footer_data)
         if not match:
             return None
         try:
@@ -1199,14 +1199,14 @@ class AuraSlicer(BaseSlicer):
     
     def parse_layer_count(self) -> Optional[int]:
         info = self._parse_printinfo_json()
-        if "model" in info and "total_layer" in info["model"]:
-            return int(info["model"]["total_layer"])
+        if "model_info" in info and "total_layers" in info["model_info"]:
+            return int(info["model_info"]["total_layers"])
         return None
     
     def parse_layer_height(self) -> Optional[float]:
         info = self._parse_printinfo_json()
-        if "model" in info and "object_layer" in info["model"]:
-            return float(info["model"]["object_layer"])
+        if "model_info" in info and "macro_layer_height" in info["model_info"]:
+            return float(info["model_info"]["macro_layer_height"])
         return None
     
     # left extruder diameter
@@ -1229,12 +1229,12 @@ class AuraSlicer(BaseSlicer):
     
     def parse_object_height(self) -> Optional[float]:
         info = self._parse_printinfo_json()
-        if "model" in info and "object_height" in info["model"]:
-            return float(info["model"]["object_height"])
+        if "model_info" in info and "total_height" in info["model_info"]:
+            return float(info["model_info"]["total_height"])
         return None
     
     def parse_print_mode(self) -> Optional[str]:
-        match = re.search(r";\s*PRINTING_MODE:\s*(.+)", self.header_data)
+        match = re.search(r"; \s*PRINTING_MODE: \s*(.+)", self.header_data)
         if match:
             return match.group(1).strip()
         return None
