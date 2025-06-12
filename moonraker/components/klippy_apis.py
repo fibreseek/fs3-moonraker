@@ -6,6 +6,8 @@
 
 from __future__ import annotations
 import logging
+import os
+import shutil
 from ..utils import Sentinel
 from ..common import WebRequest, APITransport, RequestType
 
@@ -26,6 +28,7 @@ if TYPE_CHECKING:
     from ..confighelper import ConfigHelper
     from ..common import UserInfo
     from .klippy_connection import KlippyConnection as Klippy
+
     Subscription = Dict[str, Optional[List[Any]]]
     SubCallback = Callable[[Dict[str, Dict[str, Any]], float], Optional[Coroutine]]
     _T = TypeVar("_T")
@@ -91,6 +94,21 @@ class KlippyAPI(APITransport):
     async def _gcode_start_print(self, web_request: WebRequest) -> str:
         filename: str = web_request.get_str('filename')
         user = web_request.get_current_user()
+        gcodes_dir = os.path.expanduser("~/printer_data/gcodes/")
+         # 从 file_manager 组件获取 usb_mount_path
+        file_manager = self.server.lookup_component("file_manager")
+        media_dir = getattr(file_manager, 'usb_mount_path', "/media/anisoprint/")
+        filename_without_path = os.path.basename(filename)
+        gcode_path = os.path.join(gcodes_dir, filename_without_path)
+        media_path = os.path.join(media_dir, filename)
+
+        if not os.path.exists(gcode_path):
+            if os.path.exists(media_path):
+                logging.info(f"Found G-code file at media path: {media_path}, copying to {gcode_path}")
+                shutil.copy2(media_path, gcode_path)
+            else:
+                logging.info(f"G-code file not found at media path: {media_path}")
+        filename = filename_without_path
         return await self.start_print(filename, user=user)
 
     async def _gcode_restart(self, web_request: WebRequest) -> str:
