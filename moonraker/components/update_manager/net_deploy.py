@@ -60,6 +60,8 @@ class NetDeploy(AppDeploy):
         self._is_prerelease: bool = False
         self._path_writable: bool = False
         self._configure_persistent_files(config)
+        self.is_gitee = config.getboolean('is_gitee', False)
+        self.body_message: Optional[str] = None
 
     def _configure_persistent_files(self, config: ConfigHelper) -> None:
         if self.type == AppType.EXECUTABLE:
@@ -242,16 +244,28 @@ class NetDeploy(AppDeploy):
                 self.log_info("Invalid Installation, aborting remote refresh")
                 return {}
             repo = self.repo
-        if tag is not None:
-            resource = f"repos/{repo}/releases/tags/{tag}"
-        elif self.channel == Channel.STABLE:
-            resource = f"repos/{repo}/releases/latest"
+        if self.is_gitee:
+            if tag is not None:
+                resource = f"repos/{repo}/releases/tags/{tag}"
+            elif self.channel == Channel.STABLE:
+                resource = f"repos/{repo}/releases/latest"
+            else:
+                resource = f"repos/{repo}/releases?per_page=1"
+            client = self.cmd_helper.get_http_client()
+            resp = await client.gitee_api_request(
+                resource, attempts=3, retry_pause_time=.5
+            )
         else:
-            resource = f"repos/{repo}/releases?per_page=1"
-        client = self.cmd_helper.get_http_client()
-        resp = await client.github_api_request(
-            resource, attempts=3, retry_pause_time=.5
-        )
+            if tag is not None:
+                resource = f"repos/{repo}/releases/tags/{tag}"
+            elif self.channel == Channel.STABLE:
+                resource = f"repos/{repo}/releases/latest"
+            else:
+                resource = f"repos/{repo}/releases?per_page=1"
+            client = self.cmd_helper.get_http_client()
+            resp = await client.github_api_request(
+                resource, attempts=3, retry_pause_time=.5
+            )
         release: Union[List[Any], Dict[str, Any]] = {}
         if resp.status_code == 304:
             if resp.content:
@@ -280,9 +294,30 @@ class NetDeploy(AppDeploy):
         result = await self._fetch_github_version()
         if not result:
             return
+
+        logging.info(f"Fetched remote version result: {result}")
+        if self.is_gitee:
+            assets: List[Dict[str, Any]] = result.get("assets", [{}])
+            release_asset: Dict[str, Any] = assets[0] if assets else {}
+            dl_url = release_asset.get("browser_download_url", "?")
+            if dl_url.startswith("/"):
+                dl_url = f"https://gitee.com{dl_url}"
+            logging.info(f"Gitee asset url: {dl_url}")
+
+            body_message = result.get("body", "")
+            self.body_message = body_message
+            logging.info(f"Gitee release body: {body_message}")
+        else:
+            assets: List[Dict[str, Any]] = result.get("assets", [{}])
+            release_asset: Dict[str, Any] = assets[0] if assets else {}
+            dl_url: str = release_asset.get('browser_download_url', "?")
+            self.log_info(f"Github asset url: {dl_url}")
+
+            body_message = result.get("body", "")
+            self.body_message = body_message
+            logging.info(f"Github release body: {body_message}")
+
         self.remote_version = result.get('name', "?")
-        assets: List[Dict[str, Any]] = result.get("assets", [{}])
-        release_asset: Dict[str, Any] = assets[0] if assets else {}
         if self.asset_name is not None:
             for asset in assets:
                 if asset.get("name", "") == self.asset_name:
@@ -290,7 +325,6 @@ class NetDeploy(AppDeploy):
                     break
             else:
                 logging.info(f"Asset '{self.asset_name}' not found")
-        dl_url: str = release_asset.get('browser_download_url', "?")
         content_type: str = release_asset.get('content_type', "?")
         size: int = release_asset.get('size', 0)
         self.dl_info = (dl_url, content_type, size)
@@ -318,7 +352,8 @@ class NetDeploy(AppDeploy):
             f"Download Size: {size}\n"
             f"Content Type: {content_type}\n"
             f"Rollback Version: {self.rollback_version}\n"
-            f"Rollback Repo: {self.rollback_repo}"
+            f"Rollback Repo: {self.rollback_repo}\n"
+            f"Body Message: {self.body_message}"
             f"{warn_str}"
         )
 
@@ -417,7 +452,7 @@ class NetDeploy(AppDeploy):
                 return False
             start_msg = "Updating..."
         if dl_url == "?":
-            raise self.server.error(f"{self.prefix}Invalid download url")
+            raise self.server.error(f"{self.prefix}Invalid download url: {dl_url}")
         current_version = self.version
         event_loop = self.server.get_event_loop()
         self.notify_status(start_msg)
@@ -496,6 +531,7 @@ class NetDeploy(AppDeploy):
             'rollback_version': self.rollback_version,
             'last_error': self.last_error,
             'warnings': self.warnings,
-            'anomalies': self.anomalies
+            'anomalies': self.anomalies,
+            'body_message': self.body_message
         })
         return status

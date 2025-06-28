@@ -214,6 +214,17 @@ class HttpClient:
                 resp_hdrs['X-Ratelimit-Reset'])
         return resp
 
+    async def gitee_api_request(self, resource: str, **kwargs) -> HttpResponse:
+        url = f"https://gitee.com/api/v5/{resource.lstrip('/')}"
+        logging.info(f"Sending GET request to Gitee API: {url}")
+        resp = await self.request(
+            "GET", url,
+            headers={"Accept": "application/json"},
+            **kwargs
+        )
+        logging.info(f"Gitee API response status: {resp.status_code}, headers: {dict(resp.headers)}")
+        return resp
+
     def github_api_stats(self) -> Dict[str, Any]:
         return {
             'github_rate_limit': self.gh_rate_limit,
