@@ -255,6 +255,9 @@ class BaseSlicer(object):
     def parse_first_layer_extr_temp1(self) -> Optional[float]:
         return None
 
+    def parse_bounding_box_size(self) -> Optional[List[Dict[str, Any]]]:
+        return None
+
     def parse_filament_change_count(self) -> Optional[int]:
         return None
 
@@ -1233,6 +1236,29 @@ class AuraSlicer(BaseSlicer):
             return float(info["model_info"]["total_height"])
         return None
     
+    def parse_bounding_box_size(self) -> Optional[List[Dict[str, Any]]]:
+        info = self._parse_printinfo_json()
+        if "model_info" in info and "boundingbox_min" in info["model_info"]:
+            x_min = float(info["model_info"]["boundingbox_min"]["X"])
+            y_min = float(info["model_info"]["boundingbox_min"]["Y"])
+            z_min = float(info["model_info"]["boundingbox_min"]["Z"])
+        if "model_info" in info and "boundingbox_max" in info["model_info"]:
+            x_max = float(info["model_info"]["boundingbox_max"]["X"])
+            y_max = float(info["model_info"]["boundingbox_max"]["Y"])
+            z_max = float(info["model_info"]["boundingbox_max"]["Z"])
+        else:
+            return None
+        if None not in (x_min, x_max, y_min, y_max, z_min, z_max):
+            return {
+            "x_min": x_min,
+            "x_max": x_max,
+            "y_min": y_min,
+            "y_max": y_max,
+            "z_min": z_min,
+            "z_max": z_max,
+            }
+        return None
+
     def parse_print_mode(self) -> Optional[str]:
         match = re.search(r"; \s*PRINTING_MODE: \s*(.+)", self.header_data)
         if match:
@@ -1303,6 +1329,7 @@ SUPPORTED_DATA = [
     'print_mode',
     'first_layer_extr_temp1',
     'nozzle_diameter1',
+    'bounding_box_size',
 ]
 
 PPC_REGEX = (
