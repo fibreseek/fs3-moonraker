@@ -769,6 +769,28 @@ class Timelapse:
                         except Exception:
                             logging.exception(f"Error running cmd '{cmd}'")
 
+                ###############################################################
+                # NEW: Delete all frame files after successful render
+                ###############################################################
+                try:
+                    # Get all frame files in the temporary directory
+                    frame_files = glob.glob(os.path.join(self.temp_dir, "frame*.jpg"))
+                    
+                    # Delete each frame file
+                    for frame_file in frame_files:
+                        os.remove(frame_file)
+                        logging.debug(f"Deleted frame: {os.path.basename(frame_file)}")
+                    
+                    # Log deletion summary
+                    logging.info(f"Deleted {len(frame_files)} frame files after rendering")
+                    
+                    # Reset frame counter and last frame file reference
+                    self.framecount = 0
+                    self.lastframefile = ""
+                except Exception as e:
+                    # Handle any errors during deletion
+                    logging.error(f"Error deleting frame files: {str(e)}")
+                ###############################################################
             else:
                 status = "error"
                 msg = f"Rendering Video failed: {cmd} : {self.lastcmdreponse}"
