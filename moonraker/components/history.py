@@ -133,11 +133,14 @@ class HistorySqlDefinition(SqlTableDefinition):
             filament_used REAL NOT NULL,
             metadata pyjson,
             auxiliary_data pyjson NOT NULL,
-            instance_id TEXT NOT NULL
+            instance_id TEXT NOT NULL,
+            e_filament_used REAL NOT NULL,
+            u_filament_used REAL NOT NULL,
+            v_filament_used REAL NOT NULL
         )
         """
     )
-    version = 1
+    version = 2
 
     def _get_entry_item(
         self, entry: Dict[str, Any], name: str, default: Any = 0.
@@ -173,7 +176,10 @@ class HistorySqlDefinition(SqlTableDefinition):
                                 self._get_entry_item(entry, "filament_used"),
                                 self._get_entry_item(entry, "metadata", {}),
                                 self._get_entry_item(entry, "auxiliary_data", []),
-                                "default"
+                                "default",
+                                0, #e_filament_used
+                                0, #u_filament_used
+                                0  #v_filament_used
                             )
                         )
                     except KeyError:
@@ -187,6 +193,18 @@ class HistorySqlDefinition(SqlTableDefinition):
                         conv_vals
                     )
             db_provider.wipe_local_namespace("history")
+        elif last_version <= 1:
+            conn = db_provider.connection
+            # Add new columns with default value 0 if they do not exist
+            for col in ["e_filament_used", "u_filament_used", "v_filament_used"]:
+                try:
+                    conn.execute(
+                        f"ALTER TABLE {HIST_TABLE} ADD COLUMN {col} REAL NOT NULL DEFAULT 0"
+                    )
+                except Exception:
+                    # Ignore if column already exists
+                    logging.info(f"Column '{col}' already exists in '{HIST_TABLE}' table or could not be added.")
+                    pass
 
 class History:
     def __init__(self, config: ConfigHelper) -> None:
@@ -441,7 +459,10 @@ class History:
             job.filament_used,
             job.metadata,
             job.auxiliary_data,
-            "default"
+            "default",
+            job.e_filament_used,
+            job.u_filament_used,
+            job.v_filament_used
         ]
         placeholders = ",".join("?" * len(values))
         async with self.history_table as tx:
@@ -610,6 +631,9 @@ class PrinterJob:
     def __init__(self, data: Dict[str, Any] = {}) -> None:
         self.end_time: Optional[float] = None
         self.filament_used: float = 0
+        self.e_filament_used: float = 0
+        self.u_filament_used: float = 0
+        self.v_filament_used: float = 0
         self.filename: str = ""
         self.metadata: Dict[str, Any] = {}
         self.print_duration: float = 0.

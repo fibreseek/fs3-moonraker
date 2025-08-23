@@ -2,6 +2,7 @@ import os
 import json
 import logging
 from typing import Dict, Any, List, Optional
+from ...common import JobEvent
 
 class MaterialManager:
     def __init__(self, config):
@@ -37,8 +38,91 @@ class MaterialManager:
         
         # 注册JSON-RPC接口
         self._register_endpoints()
+
+        self.server.register_event_handler(
+            "job_state:state_changed", self._on_job_state_changed)
         
         self.logger.info("Material Manager initialized successfully")
+    
+    async def _on_job_state_changed(
+        self,
+        job_event: JobEvent,
+        prev_stats: Dict[str, Any],
+        new_stats: Dict[str, Any]
+    ) -> None:
+        job_event == JobEvent.PAUSED
+        if job_event == JobEvent.COMPLETE:
+            await self.finish_job("completed", new_stats)
+        elif job_event == JobEvent.ERROR:
+            await self.finish_job("error", new_stats)
+        elif job_event in (JobEvent.CANCELLED, JobEvent.STANDBY):
+            # Cancel on "standby" for backward compatibility with
+            # `CLEAR_PAUSE/SDCARD_RESET_FILE` workflow
+            await self.finish_job("cancelled", prev_stats)
+    
+    async def finish_job(self, status: str, pstats: Dict[str, Any]) -> None:
+        # 获取当前使用的耗材长度（毫米）
+        e_filament_used = pstats.get('e_filament_used', 0)
+        u_filament_used = pstats.get('u_filament_used', 0)
+        v_filament_used = pstats.get('v_filament_used', 0)
+        update_spools = False
+
+        # 检查F料卷是否存在并更新耗材使用量
+        if 'spools' in self.spools and 'F' in self.spools['spools']:
+            spool_f = self.spools['spools']['F']
+            
+            # 初始化filament_used_mm字段（如果不存在）
+            if 'filament_used_mm' not in spool_f:
+                spool_f['filament_used_mm'] = 0.0
+            
+            # 累加耗材使用量
+            spool_f['filament_used_mm'] += u_filament_used
+            update_spools = True
+            
+            self.logger.info(
+                f"Job finished with status '{status}': "
+                f"Added {u_filament_used}mm to F spool, "
+                f"u total filament used: {spool_f['filament_used_mm']}mm"
+            )
+        if 'spools' in self.spools and 'P1' in self.spools['spools']:
+            spool_p1 = self.spools['spools']['P1']
+            
+            # 初始化filament_used_mm字段（如果不存在）
+            if 'filament_used_mm' not in spool_p1:
+                spool_p1['filament_used_mm'] = 0.0
+
+            # 累加耗材使用量
+            spool_p1['filament_used_mm'] += v_filament_used
+            update_spools = True
+            
+            self.logger.info(
+                f"Job finished with status '{status}': "
+                f"Added {v_filament_used}mm to P1 spool, "
+                f"v total filament used: {spool_p1['filament_used_mm']}mm"
+            )
+        if 'spools' in self.spools and 'P2' in self.spools['spools']:
+            spool_p2 = self.spools['spools']['P2']
+            
+            # 初始化filament_used_mm字段（如果不存在）
+            if 'filament_used_mm' not in spool_p2:
+                spool_p2['filament_used_mm'] = 0.0
+
+            # 累加耗材使用量
+            spool_p2['filament_used_mm'] += e_filament_used
+            update_spools = True
+
+            self.logger.info(
+                f"Job finished with status '{status}': "
+                f"Added {e_filament_used}mm to P2 spool, "
+                f"e total filament used: {spool_p2['filament_used_mm']}mm"
+            )
+
+        if update_spools:
+            self._save_spools()
+            self.logger.info(f"Job finished with status '{status}': Updated spools data saved.")
+
+        for key, value in pstats.items():
+            self.logger.info(f"Job finished with status '{status}': {key} = {value}")
 
     def _register_endpoints(self):
         """注册所有JSON-RPC端点"""
@@ -121,20 +205,26 @@ class MaterialManager:
                 "F": {
                     "material_id": "",
                     "color": "",
-                    "total_weight": 0.0,
-                    "remaining_weight": 0.0
+                    "total_length_mm": 0.0,
+                    "total_weight_mg": 0.0,
+                    "remaining_weight": 0.0,
+                    "filament_used_mm": 0.0
                 },
                 "P1": {
                     "material_id": "",
                     "color": "",
-                    "total_weight": 0.0,
-                    "remaining_weight": 0.0
+                    "total_length_mm": 0.0,
+                    "total_weight_mg": 0.0,
+                    "remaining_weight": 0.0,
+                    "filament_used_mm": 0.0
                 },
                 "P2": {
                     "material_id": "",
                     "color": "",
-                    "total_weight": 0.0,
-                    "remaining_weight": 0.0
+                    "total_length_mm": 0.0,
+                    "total_weight_mg": 0.0,
+                    "remaining_weight": 0.0,
+                    "filament_used_mm": 0.0
                 }
             }
         }
@@ -186,8 +276,9 @@ class MaterialManager:
             result[spool_id] = {
                 "material_id": spool_data.get("material_id", ""),
                 "color": spool_data.get("color", ""),
-                "total_weight": spool_data.get("total_weight", 0.0),
-                "remaining_weight": spool_data.get("remaining_weight", 0.0),
+                "total_weight_mg": spool_data.get("total_weight_mg", 0.0),
+                "filament_used_mm": spool_data.get("filament_used_mm", 0.0),
+                "total_length_mm": spool_data.get("total_length_mm", 0.0),
                 "material_info": material_info
             }
         return {"spools": result}
@@ -197,8 +288,9 @@ class MaterialManager:
         # 支持HTTP POST和JSON-RPC params
         spool_id = web_request.get_str('spool_id', None)
         color = web_request.get_str('color', None)
-        total_weight = web_request.get_float('total_weight', None)
-        remaining_weight = web_request.get_float('remaining_weight', None)
+        total_weight_mg = web_request.get_float('total_weight_mg', None)
+        total_length_mm = web_request.get_float('total_length_mm', None)
+        filament_used_mm = web_request.get_float('filament_used_mm', None)
         material_id = web_request.get_str('material_id', None)
         
         # 如果HTTP参数为空，尝试从JSON-RPC params获取
@@ -207,20 +299,26 @@ class MaterialManager:
             if isinstance(params, dict):
                 spool_id = params.get('spool_id')
                 color = params.get('color')
-                total_weight = params.get('total_weight')
-                remaining_weight = params.get('remaining_weight')
+                total_weight_mg = params.get('total_weight_mg')
+                total_length_mm = web_request.get_float('total_length_mm', None)
+                filament_used_mm = web_request.get_float('filament_used_mm', None)
                 material_id = params.get('material_id')
-                if total_weight is not None:
+                if total_weight_mg is not None:
                     try:
-                        total_weight = float(total_weight)
+                        total_weight_mg = float(total_weight_mg)
                     except (ValueError, TypeError):
                         raise self.server.error("Invalid total_weight value", 400)
-                if remaining_weight is not None:
+                if total_length_mm is not None:
                     try:
-                        remaining_weight = float(remaining_weight)
+                        total_length_mm = float(total_length_mm)
                     except (ValueError, TypeError):
-                        raise self.server.error("Invalid remaining_weight value", 400)
-        
+                        raise self.server.error("Invalid total_length_mm value", 400)
+                if filament_used_mm is not None:
+                    try:
+                        filament_used_mm = float(filament_used_mm)
+                    except (ValueError, TypeError):
+                        raise self.server.error("Invalid filament_used_mm value", 400)
+
         if not spool_id:
             raise self.server.error("Missing required parameter: spool_id", 400)
             
@@ -238,13 +336,15 @@ class MaterialManager:
             spool_data['spool_id'] = spool_id
         if color is not None:
             spool_data['color'] = str(color)
-        if total_weight is not None:
-            spool_data['total_weight'] = total_weight
-        if remaining_weight is not None:
-            spool_data['remaining_weight'] = remaining_weight
+        if total_weight_mg is not None:
+            spool_data['total_weight_mg'] = total_weight_mg
         if material_id is not None:
             spool_data['material_id'] = material_id
-        
+        if filament_used_mm is not None:
+            spool_data['filament_used_mm'] = filament_used_mm
+        if total_length_mm is not None:
+            spool_data['total_length_mm'] = total_length_mm
+
         self._save_spools()
         
         # 获取材料信息

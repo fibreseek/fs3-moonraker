@@ -155,6 +155,9 @@ GET /server/history/list?limit=50&start=50&since=1&before=5&order=asc
 | `total_duration` |     float      | The total amount of time, in seconds, the                   |
 |                  |                | job took to print.  This includes time paused.              |^
 | `filament_used`  |     float      | The amount of filament (in mm) used during the job.         |
+| `e_filament_used`|     float      | The amount of E-axis filament (in mm) used during the job.  |
+| `u_filament_used`|     float      | The amount of U-axis filament (in mm) used during the job.  |
+| `v_filament_used`|     float      | The amount of V-axis filament (in mm) used during the job.  |
 | `metadata`       |     object     | The [gcode metadata](./file_manager.md#gcode-metadata-spec) |
 |                  |                | object associated with the job.  The `job_id` and           |^
 |                  |                | `print_start_time` fields are removed from the metadata as  |^
