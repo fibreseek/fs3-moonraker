@@ -185,6 +185,13 @@ class FileManager:
             logging.info(f"USB root directory registered at {usb_mount_path}")
         else:
             logging.warning(f"USB mount path {usb_mount_path} does not exist")
+        
+        probe_analysis_path = "/tmp/results_probe_analysis"
+        if os.path.exists(probe_analysis_path):
+            self.register_directory("probe_analysis", probe_analysis_path)
+            logging.info(f"Probe analysis directory registered at {probe_analysis_path}")
+        else:
+            logging.warning(f"Probe analysis path {probe_analysis_path} does not exist")
 
     def start_file_observer(self):
         self.fs_observer.initialize()
@@ -574,6 +581,9 @@ class FileManager:
         root, dir_path = self._convert_request_path(directory)
         req_type = web_request.get_request_type()
         if req_type == RequestType.GET:
+            probe_analysis_path = "/tmp/results_probe_analysis"
+            if os.path.exists(probe_analysis_path):
+                self.register_directory("probe_analysis", probe_analysis_path)
             is_extended = web_request.get_boolean('extended', False)
             # Get list of files and subdirectories for this target
             dir_info = self._list_directory(dir_path, root, is_extended)
