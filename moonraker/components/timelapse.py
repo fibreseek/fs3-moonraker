@@ -590,8 +590,9 @@ class Timelapse:
 
         return result
 
-    def call_render(self, byrendermacro=False) -> None:
+    def call_render(self, byrendermacro=False, name=None) -> None:
         self.byrendermacro = byrendermacro
+        self.custom_name = name
         ioloop = IOLoop.current()
         ioloop.spawn_callback(self.render)
 
@@ -627,7 +628,11 @@ class Timelapse:
             now = datetime.now()
             date_time = now.strftime(self.config['time_format_code'])
             inputfiles = self.temp_dir + "frame%6d.jpg"
-            outfile = f"timelapse_{gcodefilename}_{date_time}"
+
+            if hasattr(self, 'custom_name') and self.custom_name:
+                outfile = "timelapse_" + self.custom_name
+            else:
+                outfile = f"timelapse_{gcodefilename}_{date_time}"
 
             # dublicate last frame
             duplicates = []
