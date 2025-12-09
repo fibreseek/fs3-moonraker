@@ -53,6 +53,7 @@ if TYPE_CHECKING:
     from ..klippy_apis import KlippyAPI as APIComp
     from ..database import MoonrakerDatabase as DBComp
     from ..shell_command import ShellCommandFactory as SCMDComp
+    from ..dbus_manager import DbusManager
     StrOrPath = Union[str, pathlib.Path]
     _T = TypeVar("_T")
 
@@ -1917,6 +1918,10 @@ class InotifyObserver(BaseFileSystemObserver):
         self.processing_gcode_files: Set[str] = set()
         self.pending_coroutines: List[Coroutine] = []
         self._gc_notify_task: Optional[asyncio.Task] = None
+        # UDisks2 DBus interface for USB mount detection
+        self._udisks_interface: Optional[Any] = None
+        self._usb_mount_path: str = "/media/anisoprint"
+        self._usb_rescan_handle: Optional[asyncio.TimerHandle] = None
 
     @property
     def has_fast_observe(self) -> bool:
@@ -1998,6 +2003,8 @@ class InotifyObserver(BaseFileSystemObserver):
         if self.watched_roots:
             self.log_nodes()
         self.initialized = True
+        # Initialize UDisks2 DBus monitoring for USB devices
+        self.event_loop.register_callback(self._init_udisks_monitor)
 
     async def _notify_root_updated(self,
                                    mevts: List[asyncio.Event],
@@ -2010,6 +2017,178 @@ class InotifyObserver(BaseFileSystemObserver):
         cur_path = self.watched_roots[root].get_path()
         if self.server.is_running() and cur_path == root_path:
             self.notify_filelist_changed("root_update", root, root_path)
+
+    async def _init_udisks_monitor(self) -> None:
+        """Initialize UDisks2 DBus monitoring for USB device mount/unmount events."""
+        if "usb" not in self.watched_roots:
+            logging.debug("USB root not registered, skipping UDisks2 monitor")
+            return
+
+        try:
+            dbus_mgr: DbusManager = self.server.lookup_component("dbus_manager")
+            if not dbus_mgr.is_connected():
+                logging.info(
+                    "DBus not connected, falling back to polling for USB detection"
+                )
+                self._start_usb_polling()
+                return
+
+            # Get UDisks2 ObjectManager interface to monitor mount events
+            self._udisks_interface = await dbus_mgr.get_interface(
+                "org.freedesktop.UDisks2",
+                "/org/freedesktop/UDisks2",
+                "org.freedesktop.DBus.ObjectManager"
+            )
+
+            # Subscribe to InterfacesAdded signal (triggered when filesystem is mounted)
+            self._udisks_interface.on_interfaces_added(self._on_udisks_interfaces_added)
+            # Subscribe to InterfacesRemoved signal (triggered when filesystem is unmounted)
+            self._udisks_interface.on_interfaces_removed(self._on_udisks_interfaces_removed)
+
+            logging.info("UDisks2 DBus monitor initialized for USB detection")
+
+            # Do an initial scan for any already mounted USB devices
+            self._schedule_usb_rescan(delay=1.0)
+
+        except Exception as e:
+            logging.info(
+                f"Failed to initialize UDisks2 monitor: {e}. "
+                "Falling back to polling for USB detection"
+            )
+            self._start_usb_polling()
+
+    def _start_usb_polling(self) -> None:
+        """Start polling-based USB detection as fallback."""
+        logging.info("Starting USB polling fallback (every 5 seconds)")
+        self._schedule_usb_rescan(delay=5.0, repeat=True)
+
+    def _schedule_usb_rescan(
+        self, delay: float = 2.0, repeat: bool = False
+    ) -> None:
+        """Schedule a USB directory rescan after a delay."""
+        if self._usb_rescan_handle is not None:
+            self._usb_rescan_handle.cancel()
+
+        def _do_rescan():
+            self._usb_rescan_handle = None
+            self._rescan_usb_directory()
+            if repeat:
+                self._schedule_usb_rescan(delay=5.0, repeat=True)
+
+        self._usb_rescan_handle = self.event_loop.delay_callback(delay, _do_rescan)
+
+    def _on_udisks_interfaces_added(
+        self, object_path: str, interfaces: Dict[str, Any]
+    ) -> None:
+        """
+        Called when UDisks2 adds new interfaces (e.g., when a filesystem is mounted).
+
+        Args:
+            object_path: DBus object path (e.g., /org/freedesktop/UDisks2/block_devices/sda1)
+            interfaces: Dictionary of interface names to their properties
+        """
+        # Check if this is a filesystem mount event
+        if "org.freedesktop.UDisks2.Filesystem" in interfaces:
+            fs_props = interfaces["org.freedesktop.UDisks2.Filesystem"]
+            mount_points = fs_props.get("MountPoints", [])
+
+            # MountPoints is a list of byte arrays, convert to strings
+            for mp in mount_points:
+                if isinstance(mp, (bytes, bytearray)):
+                    mount_path = bytes(mp).rstrip(b'\x00').decode('utf-8', errors='ignore')
+                else:
+                    mount_path = str(mp)
+
+                if mount_path.startswith(self._usb_mount_path):
+                    logging.info(
+                        f"UDisks2: USB device mounted at {mount_path}, "
+                        "scheduling rescan"
+                    )
+                    # Delay to allow mount to fully complete
+                    self._schedule_usb_rescan(delay=2.0)
+                    return
+
+        # Also check for block device additions that might indicate USB insertion
+        if "org.freedesktop.UDisks2.Block" in interfaces:
+            block_props = interfaces["org.freedesktop.UDisks2.Block"]
+            # Check if it's a USB device by looking at the HintSystem property
+            if not block_props.get("HintSystem", True):
+                logging.debug(f"UDisks2: New block device detected: {object_path}")
+                # Schedule a rescan in case it gets mounted to our path
+                self._schedule_usb_rescan(delay=3.0)
+
+    def _on_udisks_interfaces_removed(
+        self, object_path: str, interfaces: List[str]
+    ) -> None:
+        """
+        Called when UDisks2 removes interfaces (e.g., when a filesystem is unmounted).
+
+        Args:
+            object_path: DBus object path
+            interfaces: List of removed interface names
+        """
+        if "org.freedesktop.UDisks2.Filesystem" in interfaces:
+            logging.debug(f"UDisks2: Filesystem removed from {object_path}")
+            # Schedule a rescan to detect removed USB directories
+            self._schedule_usb_rescan(delay=1.0)
+
+    def _rescan_usb_directory(self) -> None:
+        """Rescan the USB mount directory for new or removed device directories."""
+        if "usb" not in self.watched_roots:
+            return
+
+        usb_node = self.watched_roots["usb"]
+        usb_path = usb_node.get_path()
+
+        if not os.path.isdir(usb_path):
+            logging.debug(f"USB mount path does not exist: {usb_path}")
+            return
+
+        try:
+            current_dirs = set()
+            for name in os.listdir(usb_path):
+                if name.startswith(".") or name.startswith("System Volume"):
+                    continue
+                child_path = os.path.join(usb_path, name)
+                if os.path.isdir(child_path):
+                    current_dirs.add(name)
+
+            # Find new directories that need to be watched
+            watched_children = set(usb_node.child_nodes.keys())
+            new_dirs = current_dirs - watched_children
+            removed_dirs = watched_children - current_dirs
+
+            # Add watches for new directories
+            for name in new_dirs:
+                child_path = os.path.join(usb_path, name)
+                logging.info(f"USB rescan: Found new device directory: {child_path}")
+                try:
+                    new_child = usb_node.create_child_node(name, notify=True)
+                    if new_child is not None:
+                        mevts = new_child.scan_node()
+                        self.log_nodes()
+                        if mevts:
+                            self.event_loop.register_callback(
+                                self._notify_root_updated, mevts, "usb", child_path
+                            )
+                except Exception as e:
+                    logging.warning(
+                        f"Failed to add watch for USB directory {name}: {e}"
+                    )
+
+            # Handle removed directories (inotify should catch this, but just in case)
+            for name in removed_dirs:
+                logging.info(f"USB rescan: Device directory removed: {name}")
+                child_node = usb_node.pop_child_node(name)
+                if child_node is not None:
+                    child_node.clear_watches()
+                    child_node.clear_events(include_children=True)
+                    self.log_nodes()
+                    removed_path = os.path.join(usb_path, name)
+                    self.notify_filelist_changed("delete_dir", "usb", removed_path)
+
+        except OSError as e:
+            logging.debug(f"Error scanning USB directory: {e}")
 
     def add_watch(self, node: InotifyNode) -> int:
         dir_path = node.get_path()
@@ -2373,6 +2552,22 @@ class InotifyObserver(BaseFileSystemObserver):
         self.server.send_event("file_manager:filelist_changed", result)
 
     def close(self) -> None:
+        # Cancel USB rescan timer if active
+        if self._usb_rescan_handle is not None:
+            self._usb_rescan_handle.cancel()
+            self._usb_rescan_handle = None
+        # Clean up UDisks2 signal handlers
+        if self._udisks_interface is not None:
+            try:
+                self._udisks_interface.off_interfaces_added(
+                    self._on_udisks_interfaces_added
+                )
+                self._udisks_interface.off_interfaces_removed(
+                    self._on_udisks_interfaces_removed
+                )
+            except Exception:
+                pass
+            self._udisks_interface = None
         while self.pending_coroutines:
             coro = self.pending_coroutines.pop(0)
             coro.close()
