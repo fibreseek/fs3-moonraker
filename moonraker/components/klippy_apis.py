@@ -208,9 +208,9 @@ class KlippyAPI(APITransport):
             save_commands = [
                 f"SAVE_VARIABLE VARIABLE=printing_info_job_id VALUE='\"{predicted_job_id}\"'",
                 f"SAVE_VARIABLE VARIABLE=printing_info_print_mode VALUE={print_mode}",
-                f"SAVE_VARIABLE VARIABLE=printing_info_left_preheat_temp VALUE={left_temp}",
-                f"SAVE_VARIABLE VARIABLE=printing_info_right_preheat_temp VALUE={right_temp}",
-                f"SAVE_VARIABLE VARIABLE=printing_info_bed_preheat_temp VALUE={bed_temp}",
+                f"SAVE_VARIABLE VARIABLE=printing_info_left_preheat_temperature VALUE={left_temp}",
+                f"SAVE_VARIABLE VARIABLE=printing_info_right_preheat_temperature VALUE={right_temp}",
+                f"SAVE_VARIABLE VARIABLE=printing_info_bed_preheat_temperature VALUE={bed_temp}",
                 f"SAVE_VARIABLE VARIABLE=printing_info_auto_leveling VALUE={1 if auto_leveling else 0}",
                 f"SAVE_VARIABLE VARIABLE=printing_info_mode_x_max VALUE={x_max}",
                 f"SAVE_VARIABLE VARIABLE=printing_info_mode_x_min VALUE={x_min}",
