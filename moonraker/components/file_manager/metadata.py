@@ -1077,10 +1077,13 @@ class KiriMoto(BaseSlicer):
 
 class AuraSlicer(BaseSlicer):
     def check_identity(self, data: str) -> bool:
-        match = re.search(r"Anisoprint Aura v?([0-9\.]+)\s+on", data)
+        match = re.search(
+            r"(Anisoprint Aura|FibreSeek Rocket Slicer)\s+v?([0-9\.]+)\s+on",
+            data
+        )
         if match:
-            self.slicer_name = "Aura"
-            self.slicer_version = match.group(1)
+            self.slicer_name = "Aura" if match.group(1) == "Anisoprint Aura" else "Rocket"
+            self.slicer_version = match.group(2)
             return True
         return False
     
