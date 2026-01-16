@@ -105,6 +105,13 @@ class KlippyConnection:
         self.register_remote_method(
             'process_status_update', self._process_status_update,
             need_klippy_reg=False)
+        
+        # Auto-recovery configuration
+        self.auto_recover = config.getboolean('auto_recover_on_shutdown', False)
+        self.max_recover_attempts = config.getint('max_recover_attempts', 2)
+        self.recover_delay = config.getfloat('recover_delay', 3.0)
+        self.recover_attempts = 0
+        self._auto_recover_task: Optional[asyncio.Task] = None
 
     @property
     def klippy_apis(self) -> KlippyAPI:
@@ -469,6 +476,16 @@ class KlippyConnection:
                 ):
                     # Klippy shutdown during startup event
                     self.server.send_event("server:klippy_shutdown")
+                    # Check if we should attempt auto-recovery
+                    logging.info(f"Scheduling auto-recovery attempt in {self.recover_delay} seconds")
+                    try:
+                        if self._auto_recover_task is not None and not self._auto_recover_task.done():
+                            self._auto_recover_task.cancel()
+                    except Exception:
+                        pass
+                    self._auto_recover_task = self.event_loop.create_task(
+                        self._delayed_auto_recovery(self.recover_delay)
+                    )
             else:
                 await self._verify_klippy_requirements()
                 # register methods with klippy
@@ -485,12 +502,73 @@ class KlippyConnection:
                     if self._state == KlippyState.SHUTDOWN:
                         # Klippy shutdown during ready event
                         self.server.send_event("server:klippy_shutdown")
+                        # Check if we should attempt auto-recovery
+                        logging.info(f"Scheduling auto-recovery attempt in {self.recover_delay} seconds")
+                        try:
+                            if self._auto_recover_task is not None and not self._auto_recover_task.done():
+                                self._auto_recover_task.cancel()
+                        except Exception:
+                            pass
+                        self._auto_recover_task = self.event_loop.create_task(
+                            self._delayed_auto_recovery(self.recover_delay)
+                        )
                 else:
                     logging.info(
                         "Klippy state transition from ready during init, "
                         f"new state: {self._state}"
                     )
             self._klippy_initializing = False
+
+    async def _attempt_auto_recovery(self) -> None:
+        """Attempt to automatically recover Klippy when it's in SHUTDOWN state."""
+        logging.info("Klippy has entered SHUTDOWN state")
+        if not self.auto_recover:
+            return
+        
+        # Check if we're in the middle of initialization
+        if self._klippy_initializing:
+            logging.debug("Skipping auto-recovery during initialization")
+            return
+        
+        # Check if we've exceeded maximum recovery attempts
+        if self.recover_attempts >= self.max_recover_attempts:
+            logging.warning(
+                f"Maximum auto-recovery attempts ({self.max_recover_attempts}) exceeded. "
+                "Manual intervention required."
+            )
+            return
+        
+        # All checks passed, attempt recovery
+        self.recover_attempts += 1
+        
+        logging.info(
+            f"Attempting auto-recovery of Klippy (attempt {self.recover_attempts}/"
+            f"{self.max_recover_attempts})"
+        )
+        
+        try:
+            # Send FIRMWARE_RESTART command to Klippy
+            await self.klippy_apis.run_gcode("FIRMWARE_RESTART")
+            logging.info("FIRMWARE_RESTART command sent successfully")
+            
+            # Reset recovery attempts if this was successful
+            # (we'll know if it was successful when Klippy comes back to READY state)
+        except ServerError as e:
+            logging.error(f"Failed to send FIRMWARE_RESTART command: {e}")
+        except Exception as e:
+            logging.exception(f"Unexpected error during auto-recovery: {e}")
+
+    async def _delayed_auto_recovery(self, delay: float) -> None:
+        """Helper coroutine to delay an auto-recovery attempt so the returned
+        Task can be cancelled if necessary."""
+        try:
+            await asyncio.sleep(delay)
+            await self._attempt_auto_recovery()
+        except asyncio.CancelledError:
+            logging.debug("Delayed auto-recovery task cancelled")
+            return
+        except Exception:
+            logging.exception("Error in delayed auto-recovery")
 
     async def _verify_klippy_requirements(self) -> None:
         result = await self.klippy_apis.get_object_list(default=None)
@@ -590,6 +668,16 @@ class KlippyConnection:
                     # defer the event, the init routine will handle it.
                     logging.info("Klippy has shutdown")
                     self.server.send_event("server:klippy_shutdown")
+                    # Check if we should attempt auto-recovery
+                    logging.info(f"Scheduling auto-recovery attempt in {self.recover_delay} seconds")
+                    try:
+                        if self._auto_recover_task is not None and not self._auto_recover_task.done():
+                            self._auto_recover_task.cancel()
+                    except Exception:
+                        pass
+                    self._auto_recover_task = self.event_loop.create_task(
+                        self._delayed_auto_recovery(self.recover_delay)
+                    )
                 self._state = new_state
         for conn, sub in self.subscriptions.items():
             conn_status: Dict[str, Any] = {}
