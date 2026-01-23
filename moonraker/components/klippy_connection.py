@@ -110,7 +110,9 @@ class KlippyConnection:
         self.auto_recover = config.getboolean('auto_recover_on_shutdown', False)
         self.max_recover_attempts = config.getint('max_recover_attempts', 2)
         self.recover_delay = config.getfloat('recover_delay', 3.0)
+        self.recover_reset_timeout = config.getfloat('recover_reset_timeout', 600.0)  # 10 minutes
         self.recover_attempts = 0
+        self._last_recover_time: Optional[float] = None
         self._auto_recover_task: Optional[asyncio.Task] = None
 
     @property
@@ -530,6 +532,17 @@ class KlippyConnection:
             logging.debug("Skipping auto-recovery during initialization")
             return
         
+        # Check if timeout has passed since last recovery attempt, reset counter if so
+        current_time = self.event_loop.get_loop().time()
+        if self._last_recover_time is not None:
+            time_since_last = current_time - self._last_recover_time
+            if time_since_last >= self.recover_reset_timeout:
+                logging.info(
+                    f"Auto-recovery timeout ({self.recover_reset_timeout:.0f}s) exceeded, "
+                    f"resetting recover_attempts from {self.recover_attempts} to 0"
+                )
+                self.recover_attempts = 0
+        
         # Check if we've exceeded maximum recovery attempts
         if self.recover_attempts >= self.max_recover_attempts:
             logging.warning(
@@ -538,7 +551,8 @@ class KlippyConnection:
             )
             return
         
-        # All checks passed, attempt recovery
+        # Update last recovery time and increment attempts
+        self._last_recover_time = current_time
         self.recover_attempts += 1
         
         logging.info(
