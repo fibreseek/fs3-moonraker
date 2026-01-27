@@ -97,3 +97,6 @@ Hierarchical configuration with:
 5. Instantiate Server with config
 6. Load core and optional components (with dependency resolution)
 7. Start HTTP server and connect to Klipper
+
+
+## Answer in Chinese

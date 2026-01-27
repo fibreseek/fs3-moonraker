@@ -96,6 +96,7 @@ class KlippyAPI(APITransport):
         user = web_request.get_current_user()
         auto_leveling: bool = web_request.get_boolean('auto_leveling', False)
         timelapse: bool = web_request.get_boolean('timelapse', False)
+        skip_foreign_detect: bool = web_request.get_boolean('skip_foreign_detect', False)
 
         gcodes_dir = os.path.expanduser("~/printer_data/gcodes/")
         file_manager = self.server.lookup_component("file_manager")
@@ -129,7 +130,8 @@ class KlippyAPI(APITransport):
             filename,
             user=user,
             auto_leveling=auto_leveling,
-            timelapse=timelapse
+            timelapse=timelapse,
+            skip_foreign_detect=skip_foreign_detect
         )
 
     async def _gcode_restart(self, web_request: WebRequest) -> str:
@@ -169,7 +171,8 @@ class KlippyAPI(APITransport):
         wait_klippy_started: bool = False,
         user: Optional[UserInfo] = None,
         auto_leveling: bool = False,
-        timelapse: bool = False
+        timelapse: bool = False,
+        skip_foreign_detect: bool = False
     ) -> str:
         # WARNING: Do not call this method from within the following
         # event handlers when "wait_klippy_started" is set to True:
@@ -250,7 +253,45 @@ class KlippyAPI(APITransport):
                 await self.run_gcode(f"SAVE_VARIABLE VARIABLE=printing_info_filename VALUE='\"{filename_with_path}\"'")
             except Exception as e:
                 logging.warning(f"Failed to save filename with path: {e}")
-        
+
+        # 打印前异物检测
+        if not skip_foreign_detect:
+            try:
+                ai_detection = self.server.lookup_component("ai_detection")
+                # 检查总开关和异物检测开关
+                if ai_detection.is_foreign_detect_enabled():
+                    result = await ai_detection.detect_foreign_object(
+                        send_notification=True  # 发送通知
+                    )
+
+                    if result.is_valid and result.has_object:
+                        # 检测有效且有异物，抛出错误阻止打印启动
+                        class_names = result.class_names if result.class_names else []
+                        objects_str = ", ".join(class_names) if class_names else "unknown objects"
+                        logging.warning(
+                            f"AI Detection: Foreign object detected: {objects_str}, blocking print start"
+                        )
+                        raise self.server.error(
+                            "Foreign object detected, please confirm before printing",
+                            403
+                        )
+                    elif result.is_valid and not result.has_object:
+                        # 检测有效且无异物，继续打印
+                        logging.info("AI Detection: No foreign objects detected, proceeding with print")
+                    else:
+                        # 检测无效（可能未连接），记录警告但继续打印
+                        logging.warning(
+                            "AI Detection: Foreign object detection not available, "
+                            "proceeding with print anyway"
+                        )
+                else:
+                    logging.info("AI Detection: Foreign object detection disabled, skipping...")
+            except self.server.error:
+                raise  # 重新抛出 server.error
+            except Exception as e:
+                # 异常记录警告但继续打印（容错处理）
+                logging.warning(f"AI Detection: Foreign object check failed: {e}, proceeding with print")
+
         # Escape existing double quotes in the file name
         filename_only = filename_only.replace("\"", "\\\"")
         script = f'SDCARD_PRINT_FILE FILENAME="{filename_only}"'
@@ -258,6 +299,7 @@ class KlippyAPI(APITransport):
             await self.klippy.wait_started()
         logging.info(f"Requesting Job Start, filename_with_path = {filename_with_path}, filename_only = {filename_only}")
         ret = await self.run_gcode(script)
+
         self.server.send_event("klippy_apis:job_start_complete", user)
         return ret
 
