@@ -533,7 +533,7 @@ class KlippyConnection:
             return
         
         # Check if timeout has passed since last recovery attempt, reset counter if so
-        current_time = self.event_loop.get_loop().time()
+        current_time = time.time()
         if self._last_recover_time is not None:
             time_since_last = current_time - self._last_recover_time
             if time_since_last >= self.recover_reset_timeout:
