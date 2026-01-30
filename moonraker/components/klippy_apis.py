@@ -94,36 +94,39 @@ class KlippyAPI(APITransport):
     async def _gcode_start_print(self, web_request: WebRequest) -> str:
         filename: str = web_request.get_str('filename')
         user = web_request.get_current_user()
-        # 获取用户可选参数
         auto_leveling: bool = web_request.get_boolean('auto_leveling', False)
         timelapse: bool = web_request.get_boolean('timelapse', False)
-        
+
         gcodes_dir = os.path.expanduser("~/printer_data/gcodes/")
-         # 从 file_manager 组件获取 usb_mount_path
         file_manager = self.server.lookup_component("file_manager")
         media_dir = getattr(file_manager, 'usb_mount_path', "/media/anisoprint/")
 
         # 处理文件路径：移除开头的 "gcodes/"，保留子文件夹路径
         if filename.startswith('gcodes/'):
-            filename_with_path = filename[7:]  # 移除 "gcodes/" 前缀
+            filename = filename[7:]
         elif filename.startswith('/'):
-            filename_with_path = filename[1:]  # 移除开头的 /
-        else:
-            filename_with_path = filename
+            filename = filename[1:]
 
-        filename_without_path = os.path.basename(filename_with_path)
-        gcode_path = os.path.join(gcodes_dir, filename_with_path)
-        media_path = os.path.join(media_dir, filename)
+        # 纯文件名（不带路径）
+        filename_only = os.path.basename(filename)
 
-        if not os.path.exists(gcode_path):
-            if os.path.exists(media_path):
-                logging.info(f"Found G-code file at media path: {media_path}, copying to {gcode_path}")
-                shutil.copy2(media_path, gcode_path)
+        # 检查本地文件（支持子文件夹）
+        local_path = os.path.join(gcodes_dir, filename)
+        usb_path = os.path.join(media_dir, filename)
+
+        # 如果本地不存在，尝试从 USB 复制
+        if not os.path.exists(local_path):
+            if os.path.exists(usb_path):
+                # USB 文件复制到 gcodes 根目录
+                dest_path = os.path.join(gcodes_dir, filename_only)
+                logging.info(f"Copying from USB: {usb_path} -> {dest_path}")
+                shutil.copy2(usb_path, dest_path)
+                filename = filename_only  # USB 文件不带路径
             else:
-                logging.info(f"G-code file not found at media path: {media_path}")
+                logging.warning(f"File not found: {local_path} or {usb_path}")
 
         return await self.start_print(
-            filename_with_path,
+            filename,
             user=user,
             auto_leveling=auto_leveling,
             timelapse=timelapse
