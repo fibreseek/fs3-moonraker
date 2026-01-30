@@ -102,8 +102,17 @@ class KlippyAPI(APITransport):
          # 从 file_manager 组件获取 usb_mount_path
         file_manager = self.server.lookup_component("file_manager")
         media_dir = getattr(file_manager, 'usb_mount_path', "/media/anisoprint/")
-        filename_without_path = os.path.basename(filename)
-        gcode_path = os.path.join(gcodes_dir, filename_without_path)
+
+        # 处理文件路径：移除开头的 "gcodes/"，保留子文件夹路径
+        if filename.startswith('gcodes/'):
+            filename_with_path = filename[7:]  # 移除 "gcodes/" 前缀
+        elif filename.startswith('/'):
+            filename_with_path = filename[1:]  # 移除开头的 /
+        else:
+            filename_with_path = filename
+
+        filename_without_path = os.path.basename(filename_with_path)
+        gcode_path = os.path.join(gcodes_dir, filename_with_path)
         media_path = os.path.join(media_dir, filename)
 
         if not os.path.exists(gcode_path):
@@ -112,10 +121,10 @@ class KlippyAPI(APITransport):
                 shutil.copy2(media_path, gcode_path)
             else:
                 logging.info(f"G-code file not found at media path: {media_path}")
-        filename = filename_without_path
+
         return await self.start_print(
-            filename, 
-            user=user, 
+            filename_with_path,
+            user=user,
             auto_leveling=auto_leveling,
             timelapse=timelapse
         )
@@ -167,7 +176,11 @@ class KlippyAPI(APITransport):
         # XXX - validate that file is on disk
         if filename[0] == '/':
             filename = filename[1:]
-        
+
+        # 保存带子文件夹路径的文件名，用于 SAVE_VARIABLE
+        filename_with_path = filename
+        filename_only = os.path.basename(filename)
+
         # 获取文件元数据
         file_manager = self.server.lookup_component("file_manager")
         metadata = file_manager.get_file_metadata(filename)
@@ -207,6 +220,7 @@ class KlippyAPI(APITransport):
             # 构造 SAVE_VARIABLE 命令列表
             save_commands = [
                 f"SAVE_VARIABLE VARIABLE=printing_info_job_id VALUE='\"{predicted_job_id}\"'",
+                f"SAVE_VARIABLE VARIABLE=printing_info_filename VALUE='\"{filename_with_path}\"'",
                 f"SAVE_VARIABLE VARIABLE=printing_info_print_mode VALUE={print_mode}",
                 f"SAVE_VARIABLE VARIABLE=printing_info_left_preheat_temperature VALUE={left_temp}",
                 f"SAVE_VARIABLE VARIABLE=printing_info_right_preheat_temperature VALUE={right_temp}",
@@ -228,13 +242,18 @@ class KlippyAPI(APITransport):
                     logging.warning(f"Failed to execute command '{cmd}': {e}")
         else:
             logging.warning(f"No metadata found for file: {filename}, skipping parameter setup")
+            # 即使没有元数据，也保存带路径的文件名
+            try:
+                await self.run_gcode(f"SAVE_VARIABLE VARIABLE=printing_info_filename VALUE='\"{filename_with_path}\"'")
+            except Exception as e:
+                logging.warning(f"Failed to save filename with path: {e}")
         
         # Escape existing double quotes in the file name
-        filename = filename.replace("\"", "\\\"")
-        script = f'SDCARD_PRINT_FILE FILENAME="{filename}"'
+        filename_only = filename_only.replace("\"", "\\\"")
+        script = f'SDCARD_PRINT_FILE FILENAME="{filename_only}"'
         if wait_klippy_started:
             await self.klippy.wait_started()
-        logging.info(f"Requesting Job Start, filename = {filename}")
+        logging.info(f"Requesting Job Start, filename_with_path = {filename_with_path}, filename_only = {filename_only}")
         ret = await self.run_gcode(script)
         self.server.send_event("klippy_apis:job_start_complete", user)
         return ret
