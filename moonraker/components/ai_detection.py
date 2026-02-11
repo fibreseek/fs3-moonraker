@@ -516,6 +516,10 @@ class AIDetectionClient:
             logging.info("AI Detection: Auto-connecting to server...")
             self._connect_task = self.eventloop.create_task(self._do_connect())
 
+    def is_enabled(self) -> bool:
+        """检查 AI 检测总开关是否启用（不考虑连接状态）"""
+        return self.coordinator_config.enable
+
     def is_foreign_detect_enabled(self) -> bool:
         """检查是否启用异物检测"""
         return (
