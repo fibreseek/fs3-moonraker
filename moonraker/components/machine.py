@@ -94,6 +94,7 @@ class Machine:
         if sudo_template is not None:
             self._sudo_password = sudo_template.render()
         self._public_ip = ""
+        self.machine_id: Optional[str] = ""
         self.system_info: Dict[str, Any] = {
             'python': {
                 "version": tuple(sys.version_info),
@@ -122,6 +123,10 @@ class Machine:
         logging.info(f"Using System Provider: {self.provider_type}")
         self.validator = InstallValidator(config)
         self.sudo_requests: List[Tuple[SudoCallback, str]] = []
+        # Register event handler for Klipper ready
+        self.server.register_event_handler(
+            "server:klippy_ready", self._on_klippy_ready
+        )
 
         self.server.register_endpoint(
             "/machine/reboot", RequestType.POST, self._handle_machine_request
@@ -565,6 +570,25 @@ class Machine:
         except Exception:
             logging.info("Error Reading SDCard CSD Register")
         return sd_info
+
+    async def _on_klippy_ready(self) -> None:
+        """Called when Klipper is ready, fetches machine id from Klipper"""
+        logging.info("Klipper is ready, fetching machine id")
+        try:
+            # Get Klippy API component
+            klippy_apis = self.server.lookup_component("klippy_apis")
+            # Call info endpoint to get machine id
+            info = await klippy_apis.get_klippy_info()
+            if isinstance(info, dict) and "machine_id" in info:
+                self.machine_id = info["machine_id"]
+                logging.info(f"Retrieved machine id from Klipper: {self.machine_id}")
+                # Notify other components
+                self.server.send_event("machine:machine_id_available", self.machine_id)
+            else:
+                logging.warning("Machine id not found in Klipper info")
+                logging.info(f"Klippy info: {info}")
+        except Exception as e:
+            logging.warning(f"Failed to get machine id from Klipper: {e}")
 
     def _get_cpu_info(self) -> Dict[str, Any]:
         cpu_file = pathlib.Path("/proc/cpuinfo")

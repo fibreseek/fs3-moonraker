@@ -204,6 +204,7 @@ class SSDPServer(asyncio.protocols.DatagramProtocol):
         self.running: bool = False
         self.close_fut: Optional[asyncio.Future] = None
         self.response_handle: Optional[asyncio.TimerHandle] = None
+        self.machine_id: str = ""
         eventloop = self.server.get_event_loop()
         self.boot_id = int(eventloop.get_loop_time())
         self.config_id = 1
@@ -217,6 +218,19 @@ class SSDPServer(asyncio.protocols.DatagramProtocol):
             content_type="application/xml",
             auth_required=False
         )
+        # Register event handler for machine id available
+        self.server.register_event_handler(
+            "machine:machine_id_available", self._on_machine_id_available
+        )
+
+    def _on_machine_id_available(self, machine_id: str) -> None:
+        """Called when machine id is available, updates response headers"""
+        logging.info(f"Machine id available: {machine_id}")
+        self.machine_id = machine_id
+        for header in self.response_headers:
+            if header.startswith("X-MACHINE-ID"):
+                self.response_headers.remove(header)
+        self.response_headers.append(f"X-MACHINE-ID: {self.machine_id}")
 
     def _create_ssdp_socket(
         self,
@@ -239,6 +253,7 @@ class SSDPServer(asyncio.protocols.DatagramProtocol):
         return sock
 
     async def start(self) -> None:
+        logging.info("Starting SSDP Server")
         if self.running:
             return
         try:
@@ -249,7 +264,9 @@ class SSDPServer(asyncio.protocols.DatagramProtocol):
             _loop = asyncio.get_running_loop()
             ret = await _loop.create_datagram_endpoint(lambda: self, sock=sock)
             self.transport, _ = ret
+            logging.info("SSDP Server Started")
         except (socket.error, OSError):
+            logging.exception("Error binding SSDP socket")
             return
         self.running = True
 
@@ -288,6 +305,7 @@ class SSDPServer(asyncio.protocols.DatagramProtocol):
             "ST: upnp:rootdevice",
             "EXT:",
             f"SERVER: {SSDP_SERVER_ID}",
+            f"X-SPECIAL-MARKER: FIBRESEEK3D",
             f"CACHE-CONTROL: max-age={SSDP_MAX_AGE}",
             f"BOOTID.UPNP.ORG: {self.boot_id}",
             f"CONFIGID.UPNP.ORG: {self.config_id}",
@@ -338,6 +356,7 @@ class SSDPServer(asyncio.protocols.DatagramProtocol):
         logging.debug("SSDP Resume Writing Requested")
 
     def datagram_received(self, data: bytes, addr: tuple[str | Any, int]) -> None:
+        # logging.info(f"SSDP Datagram Received: {data} from {addr}")
         if not self.registered:
             return
         try:
@@ -354,20 +373,29 @@ class SSDPServer(asyncio.protocols.DatagramProtocol):
             if len(parts) < 2:
                 continue
             headers[parts[0].upper()] = parts[1].strip()
+        special_marker = headers.get("X-SPECIAL-MARKER")
+        if special_marker != "FIBRESEEK3D":
+            # logging.info("SSDP Special Marker not found or doesn't match")
+            return
+        logging.info(f"SSDP Datagram Received: {data} from {addr}")
         if (
             ssdp_command != "M-SEARCH * HTTP/1.1" or
             headers.get("MAN") != '"ssdp:discover"'
         ):
             # Not a discovery request
+            logging.info(f"SSDP Command {ssdp_command} doesn't apply")
             return
         if headers.get("ST") not in ["upnp:rootdevice", "ssdp:all"]:
             # Service Type doesn't apply
+            logging.info(f"SSDP Service Type {headers.get('ST')} doesn't apply")
             return
         if self.response_handle is not None:
             # response in progress
+            logging.info("SSDP Response already in progress, ignoring request")
             return
         if "MX" in headers:
             delay_time = random.uniform(0, float(headers["MX"]))
+            logging.info(f"Delaying response by {delay_time:.2f} seconds")
             eventloop = self.server.get_event_loop()
             self.response_handle = eventloop.delay_callback(
                 delay_time, self._respond_to_discovery, addr
@@ -403,6 +431,8 @@ class SSDPServer(asyncio.protocols.DatagramProtocol):
                     f"LOCATION: {self.base_url}/server/zeroconf/ssdp",
                     "EXT:",
                     f"SERVER: {SSDP_SERVER_ID}",
+                    f"X-SPECIAL-MARKER: FIBRESEEK3D",
+                    f"X-MACHINE-ID: {self.machine_id}",
                     f"CACHE-CONTROL: max-age={SSDP_MAX_AGE}",
                     f"BOOTID.UPNP.ORG: {self.boot_id}",
                     f"CONFIGID.UPNP.ORG: {self.config_id}",
