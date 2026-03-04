@@ -348,7 +348,7 @@ class CoordinatorConfig:
     def from_config(cls, config: "ConfigHelper") -> "CoordinatorConfig":
         """从配置文件加载配置"""
         return cls(
-            enable=config.getboolean("enable", True),
+            enable=config.getboolean("enable", False),
             enable_foreign_detect=config.getboolean(
                 "enable_foreign_detect", True
             ),
