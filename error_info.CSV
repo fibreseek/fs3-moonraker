@@ -1,0 +1,195 @@
+Error Code,报错信息,报错信息多语言,解决方法/sop链接（英文）,解决方法/sop链接（多语言）,报错原因
+10001,Timer too close,"zh-CN：
+zh-TW：
+en-US：
+ja-JP：
+ko-KR：
+de-DE：
+fr-FR：
+es-ES：
+it-IT：
+ru-RU：","zh-CN：
+zh-TW：
+en-US：
+ja-JP：
+ko-KR：
+de-DE：
+fr-FR：
+es-ES：
+it-IT：
+ru-RU：",,CPU过载，在klipper主线程中受到一些IO读写或者阻塞性操作导致报错，一般是代码设计问题
+10002,Lost communication with MCU,,,"需要使用到万用表。
+1、检查复合头加热棒是否短路、断路。
+2、检查复合头的接地线是否接上。
+3、检查复合头和塑料头两个头和接地线是否连通。","主要原因是mcu通信中断
+1. 硬件USB链路可能受到干扰或者连接松动
+2. 软件系统运行负载过高"
+10003,Serial connection closed,,,,
+10004,mcu '%s': Unable to connect,,,"打印机故障，有两种可能：
+1、MCU和打印机主板通信线松动
+2、打印机主板损坏，联系客服","打印机主板通信中断
+mcu -> 主板
+toolhead -> 机头板"
+10005,mcu '%s': Serial connection closed,,,,
+10006,Failed automated reset of MCU '%s',,,,
+10007,Printer is not ready,,,"1.重启打印机
+2.如果是更新后出现此问题，固件更新失败，请重新更新","主要原因是Klipper服务运行异常，无法连接
+1. 更新失败导致klipper模块异常
+2. 硬件问题导致klipper启动失败"
+10008,Exception in flush_handler,,,1.导出日志，gcode文件，联系售后,"主要原因是挤出机电机同步时，出现异常
+1. UV共挤时，挤出电机设置不同步进，步进对齐异常"
+10009,Rotation distance can not be zero,,,,
+10010,Exception in priming_handler,,,1、不建议在切片时候频繁设置Pressure Advance,打印件切片时，设置的Pressure Advance频繁更改导致
+10011,Shutdown due to webhooks request,,,机器断电重启即可,网页端操作紧急停止导致的
+10012,Unable to read existing config on SAVE_CONFIG,,,"1、重新校准（重新校准仍出现该类似问题则下一步）
+2、检查磁盘空间大小（如果磁盘空间仍够则下一步）
+3、重新更新版本（怀疑是否是系统更新失败导致文件缺失）","主要发生在校准时，保存配置时出现问题
+1. 磁盘空间不足
+2. 系统更新导致配置文件信息缺失"
+10013,Unable to parse existing config on SAVE_CONFIG,,,,
+10014,Unable to write config file during SAVE_CONFIG,,,,
+10015,Error on '%s': missing %s,,,"该问题出现都是由于GCODE文件使用其他切片切出来导致，建议使用我们的切片软件。检查GCODE文件如下
+1、一般都是切出来的功能指令出现参数缺失。
+2、G1移轴指令超过打印机xyz最大范围。
+3、小部分指令与标准的G指令存在差异，可能存在我们特有的指令，其他切片特有指令我们机器不识别。","gcode解析错误
+1. 缺少必须的参数
+2. 格式不对
+3. 给定数值超限
+4. 使用了非法参数值"
+10016,Error on '%s': unable to parse %s,,,,
+10017,Error on '%s': %s must have minimum of %s,,,,
+10018,Error on '%s': %s must have maximum of %s,,,,
+10019,Error on '%s': %s must be above %s,,,,
+10020,Error on '%s': %s must be below %s,,,,
+10021,The value '%s' is not valid for %s,,,,
+10022,Printer is already printing,,,打印过程中，不要在做开启其他打印任务的操作。,主要发生在打印操作的指令中，发送了重复的指令导致报错
+10023,Printer is not supported command,,,"1、避免GCODE文件使用其他切片软件切出来导致的，我们机器不识别。
+2、提示用户不要自主输入非法G指令。",如果使用了M28、M29、M30非法指令，会报此错误
+10024,Unable to open file,,,"1.检查gcode名称是否有非法字符，如!@$%^*()[]{}#&空格（建议使用字母、数字、下划线 _ 和连字符 -）
+2.打印文件后缀是否合法，如.gcode,.g,.gco,.GCODE
+3.文件是否破损","gcode文件无法打开
+1. 文件上传或者拷贝时破损
+2. 文件权限过低，无法读取"
+10025,Internal error on command,,,,"gcode命令内部错误
+1. 使用了非法的gcode命令
+2. gcode命令实现代码中有语法错误"
+10026,extruder fiber filament ran out!,,,"第一步：看是否碳纤维料盘还有余料，没有则更换新料盘重新进料。
+第二步：如若料盘还有料，则打开主板侧外壳，看是否是光纤传感器出现问题。
+第三步：如若光纤传感器没问题，则怀疑是否是碳纤维进料的挤出机哪里，光纤传感器的光孔安装出现问题，导致误报。",左喷嘴检测到纤维断料
+10027,extruder fiber filament clogging in the extruder!,,,"第一步：观察复合头喷嘴是否堆积大量碳纤丝导致堵头。
+第二步：检查是否是因为碳纤丝在进料管或张力传感器时，碳纤折断，导致堵头。",左喷嘴检测到纤维堵料
+10028,extruder2 plastic filament ran out!,,,复合头塑料耗材用尽更换新耗材,左喷嘴检测到塑料断料
+10029,plastic filament clogging in the extruder2!,,,如果不是因为耗材断裂引起的，只需要在复合头上将堵料部分清理干净即可。,左喷嘴检测到塑料堵料
+10030,extruder1 plastic filament ran out!,,,塑料头耗材用尽更换新耗材,右喷嘴检测到塑料断料
+10031,plastic filament clogging in the extruder1!,,,观察塑料头是否无法出料，需要拆开塑料头观察是否在料喉管处发生耗材提前融化粘连等情况。,右喷嘴检测到塑料堵料
+10032,Temperature out of range,,,"第一步：重新插拔测温传感器线（若还不行）。
+第二步：联系客服更换新的测温传感器（更换后，若还不行）。
+第三步：主板问题。联系客服更换新的机头板。","温度传感器测温超出限制
+extruder -> 左喷嘴[0,360℃]
+extruder1 -> 右喷嘴[0,360℃]
+chamber -> 仓温[0,70℃]
+heater_bed -> 热床[0,130℃]"
+10033,MCU 'toolhead' shutdown: ADC out of range,,,,"如果toolhead mcu报ADC out of range，是指温度超出了限制
+一般是加热棒连接线有问题"
+10034,Requested temperature (%.1f) out of range (%.1f:%.1f),,,"1、避免GCODE文件使用其他切片软件切出来导致的温度超量程。（排查M191\M190\M141\M140\M104\M109）
+2、用户不要自主输入非法G指令。","设置温度超过传感器温度限制
+1. gcode代码设置温度错误"
+10035,pid_calibrate interrupted,,,重新校准pid即可,"主要发生在喷嘴温度校准过程中
+1. PID 校准过程被中断或未能正常完成时触发"
+10036,T0/T1 center init failed,,,"1、观察偏移校准时，机头是否移动到了按键位置。如果移动到了说明是光电按钮传感器出现问题。
+2、光电按钮出现问题，可以手动按下按键，然后在下方看红光是否消失。消失则代表传感器没问题。
+3、那就排查光电按钮线路问题了，触发信号没有被主板采集到。
+4、如果线路也没问题，更换主板。","偏移校准失败时，左喷嘴/右喷嘴中心位置寻位失败
+1. 喷嘴无法找到按键传感器位置
+2. 按键传感器无法触发"
+10037,Update xyz offset config file failed,,,"1.发生概率很低，先尝试重新校准
+2.报错频率很高，联系售后","偏移校准时，更新配置文件失败
+1. 文件权限问题无法写入"
+10038,"left print head throat fan malfunction, please check the hardware!",,,"第一步：检查四线风扇是否因为线松动导致。
+第二步：联系客服更换对应四线风扇。
+第三步：四线风扇对应主板损坏，联系客服更换对应主板。",左喷嘴喉管风扇转速反馈异常
+10039,"Right print head throat fan malfunction, please check the hardware!",,,,右喷嘴喉管风扇转速反馈异常
+10040,"Mainboard cooling fan malfunction, please check the hardware!",,,,主板风扇转速反馈异常
+10041,"Constant flow fan malfunction, please check the hardware!",,,,横流风机转速反馈异常
+10042,accelerometer 'adxl345' measured no data,,,联系售后更换机头板,"加速度计 “adxl345” 采集采集数据出现异常
+1. 机头板硬件可能存在问题，导致无法工作"
+10043,No accelerometer measurements found,,,,
+10044,Failed to set ADXL345 register,,,,
+10045,Invalid adxl345 id (got %x vs %x).,,,,
+10046,The homing sensor was triggered before the Z-axis moved.,,,"1、拆开机头后壳，敲击复合头喷嘴，压电陶瓷对应灯是否亮度发生变化。从而判断压电陶瓷是否损坏。
+2、若压电陶瓷未损坏，则可能是压电陶瓷安装位置发生松动，震动无法传到。
+3、压电陶瓷接线是否存在松动。
+4、z轴归位停止信号线是否连接正常。
+5、机头板或者主板损坏，概率低，出现联系售后。","z轴归零时，在移动前就触发了归位传感器
+1. 压电陶瓷触发信号受到了干扰或者连接线松动"
+10047,No trigger on z after full movement,,,,"z轴归零时，移动完所有行程都没有触发归位传感器
+1. 压电陶瓷误触发，导致无法再次触发"
+10048,Endstop %s still triggered after retract,,,"1、是否是丝杠长时间未润滑，导致阻力过大，使得归位提前误触。
+2、观察归位过程中，是否有其他因素在干扰归位。
+3.主板引脚异常，概率比较低，联系售后更换主板。","二次归位时，移动前就触发了归位信号
+1. 机头无法移动
+2. 主板信号异常"
+10049,TMC '%s' reports error: %s,,,"检查对应故障电机接线是否松动
+电机是否过热
+主板风扇工作是否正常
+如果频繁出现，开启高性能模式打印","TMC2240电机驱动报错
+stepper_x -> x轴电机
+stepper_y -> y轴电机
+stepper_z -> z轴电机
+extruder  -> 纤维挤出电机
+extruder1 -> 右喷嘴挤出电机
+extruder2 -> 复合头塑料挤出电机
+
+(ShortToSupply_A!)/(ShortToSupply_B!)G-code切片速度和打印机状态冲突或者打印机硬件接线松动
+(ErrorShutdown!)驱动温度过高警告并关闭。
+(Undervoltage!)欠压保护。
+(OvertempWarning!)驱动过温警告。
+(ShortToGND_A!)/(ShortToGND_B!)G-code切片速度和打印机状态冲突或者打印机硬件接线松动
+(OpenLoad_A!)/(OpenLoad_B!)相开路"
+10050,Heater %s not heating at expected rate,,,"1、排查加热功能是否正常(控制加热，看机头板对应的加热端口灯是否亮，如果是热床则去看固态继电器是否亮灯)如果灯亮则证明加热传感器坏。如果灯不亮则需排查连接线、机头板、主板是否损坏。
+2、加热棒和测温传感器松掉，结构上复位即可。         ","加热速率过慢，甚至没有加热
+extruder -> 左喷嘴加热器
+extruder1 -> 右喷嘴加热器
+heater_bed -> 热床加热器
+chamber   -> 加热腔"
+10051,No trigger on %s after full movement,,,"1、是否是丝杠长时间未润滑，导致阻力过大，使得归位提前误触。
+2、观察归位过程中，是否有其他因素在干扰归位。
+3.主板引脚异常，概率比较低，联系售后更换主板。","轴归零报错
+X/Y轴"
+10052,Move out of range on %s axis: 0.000,,http://www.baidu.com,检查切片文件里面G1、G0指令的位置范围,"轴移动超出范围
+x -> x轴[-43.5,325]
+y -> y轴[-6,339]
+z -> z轴[-4,250]"
+10053,Must home axis first: 0.000 0.000 0.000 [0.000],"zh-CN：zh-CN
+zh-TW：
+en-US：en-US
+ja-JP：ja-JP
+ko-KR：
+de-DE：
+fr-FR：
+es-ES：
+it-IT：
+ru-RU：",,屏幕上单纯操作移轴指令时先归位,屏幕上单纯操作移轴指令时先归位
+10054,Please set the temperature to above %.1f℃ before extrusion.,,,,"温度低于挤出最小温度（170）
+1. 一般情况未设置目标温度就执行了挤出操作"
+10055,The single extrusion length must be less than %.3fmm,,,,单次挤出长度超过限制（1000mm)
+10056,Move exceeds maximum extrusion (%.3fmm^2 vs %.3fmm^2),,,"原因	说明
+切片设置错误：线宽设置过大
+首层过宽：首层挤出量过高
+E 值错误：G-code 中 E 值计算错误
+填充过密：某些填充模式导致局部挤出过多
+清洁/排料线：开始打印前的 purge line 挤出过多","当前配置max_extrude_cross_section值为5.0
+
+报错机制举例：
+max_cross_section = 5mm2
+# 耗材截面积 = π × (1.75/2)? ≈ 2.405 mm?
+
+G1 X10 E24.9 F1000
+# 挤出比例 (axis_r) = 挤出距离 / 移动距离
+# axis_r = 24.9/10 = 2.49
+# 实际截面积 = axis_r × 耗材截面积
+# 实际截面积 = 2.49 × 2.405 = 5.988 mm?
+# 5.988 > 5.0 → 报错!
+"
+10057,Homing failed due to printer shutdown,,,,
+10058,Unhandled exception during run,,,,
