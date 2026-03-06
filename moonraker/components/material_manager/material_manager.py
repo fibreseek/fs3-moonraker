@@ -31,6 +31,11 @@ class MaterialManager:
         self.spools = {}
         
         self.logger.info("Initializing Material Manager")
+
+        # 记录上一次的耗材使用量
+        self.last_e_filament_used = 0
+        self.last_u_filament_used = 0
+        self.last_v_filament_used = 0
         
         # 加载材料和料卷数据
         self._load_materials()
@@ -50,79 +55,63 @@ class MaterialManager:
         prev_stats: Dict[str, Any],
         new_stats: Dict[str, Any]
     ) -> None:
-        job_event == JobEvent.PAUSED
         if job_event == JobEvent.COMPLETE:
-            await self.finish_job("completed", new_stats)
+            await self.update_filament_used("completed", new_stats)
         elif job_event == JobEvent.ERROR:
-            await self.finish_job("error", new_stats)
+            await self.update_filament_used("error", new_stats)
         elif job_event in (JobEvent.CANCELLED, JobEvent.STANDBY):
             # Cancel on "standby" for backward compatibility with
             # `CLEAR_PAUSE/SDCARD_RESET_FILE` workflow
-            await self.finish_job("cancelled", prev_stats)
+            await self.update_filament_used("cancelled", new_stats)
+        elif job_event == JobEvent.STARTED:
+            self.last_e_filament_used = new_stats.get('e_filament_used', 0)
+            self.last_u_filament_used = new_stats.get('u_filament_used', 0)
+            self.last_v_filament_used = new_stats.get('v_filament_used', 0)
+            logging.info(f"Job started with status '{job_event}': e_filament_used = {self.last_e_filament_used}, u_filament_used = {self.last_u_filament_used}, v_filament_used = {self.last_v_filament_used}")
+        elif job_event == JobEvent.PAUSED:
+            await self.update_filament_used("paused", new_stats)
     
-    async def finish_job(self, status: str, pstats: Dict[str, Any]) -> None:
-        # 获取当前使用的耗材长度（毫米）
-        e_filament_used = pstats.get('e_filament_used', 0)
-        u_filament_used = pstats.get('u_filament_used', 0)
-        v_filament_used = pstats.get('v_filament_used', 0)
+    async def update_filament_used(self, status: str, new_stats: Dict[str, Any]) -> None:
+        e_filament_used = new_stats.get('e_filament_used', 0)
+        u_filament_used = new_stats.get('u_filament_used', 0)
+        v_filament_used = new_stats.get('v_filament_used', 0)
         update_spools = False
 
-        # 检查F料卷是否存在并更新耗材使用量
-        if 'spools' in self.spools and 'F' in self.spools['spools']:
-            spool_f = self.spools['spools']['F']
-            
-            # 初始化filament_used_mm字段（如果不存在）
-            if 'filament_used_mm' not in spool_f:
-                spool_f['filament_used_mm'] = 0.0
-            
-            # 累加耗材使用量
-            spool_f['filament_used_mm'] += u_filament_used
-            update_spools = True
-            
-            self.logger.info(
-                f"Job finished with status '{status}': "
-                f"Added {u_filament_used}mm to F spool, "
-                f"u total filament used: {spool_f['filament_used_mm']}mm"
-            )
-        if 'spools' in self.spools and 'P1' in self.spools['spools']:
-            spool_p1 = self.spools['spools']['P1']
-            
-            # 初始化filament_used_mm字段（如果不存在）
-            if 'filament_used_mm' not in spool_p1:
-                spool_p1['filament_used_mm'] = 0.0
+        if e_filament_used > self.last_e_filament_used:
+            temp_e_filament_used = e_filament_used - self.last_e_filament_used
+            if 'spools' in self.spools and 'P2' in self.spools['spools']:
+                spool_p2 = self.spools['spools']['P2']
+                if 'filament_used_mm' not in spool_p2:
+                    spool_p2['filament_used_mm'] = 0.0
+                spool_p2['filament_used_mm'] += temp_e_filament_used
+                self.last_e_filament_used = e_filament_used
+                update_spools = True
 
-            # 累加耗材使用量
-            spool_p1['filament_used_mm'] += v_filament_used
-            update_spools = True
-            
-            self.logger.info(
-                f"Job finished with status '{status}': "
-                f"Added {v_filament_used}mm to P1 spool, "
-                f"v total filament used: {spool_p1['filament_used_mm']}mm"
-            )
-        if 'spools' in self.spools and 'P2' in self.spools['spools']:
-            spool_p2 = self.spools['spools']['P2']
-            
-            # 初始化filament_used_mm字段（如果不存在）
-            if 'filament_used_mm' not in spool_p2:
-                spool_p2['filament_used_mm'] = 0.0
-
-            # 累加耗材使用量
-            spool_p2['filament_used_mm'] += e_filament_used
-            update_spools = True
-
-            self.logger.info(
-                f"Job finished with status '{status}': "
-                f"Added {e_filament_used}mm to P2 spool, "
-                f"e total filament used: {spool_p2['filament_used_mm']}mm"
-            )
-
+        if u_filament_used > self.last_u_filament_used:
+            temp_u_filament_used = u_filament_used - self.last_u_filament_used
+            if 'spools' in self.spools and 'F' in self.spools['spools']:
+                spool_f = self.spools['spools']['F']
+                if 'filament_used_mm' not in spool_f:
+                    spool_f['filament_used_mm'] = 0.0
+                spool_f['filament_used_mm'] += temp_u_filament_used
+                self.last_u_filament_used = u_filament_used
+                update_spools = True
+                self.logger.info(f"Job updated with status '{status}': u_filament_used = {u_filament_used}")
+        if v_filament_used > self.last_v_filament_used:
+            temp_v_filament_used = v_filament_used - self.last_v_filament_used
+            if 'spools' in self.spools and 'P1' in self.spools['spools']:
+                spool_p1 = self.spools['spools']['P1']
+                if 'filament_used_mm' not in spool_p1:
+                    spool_p1['filament_used_mm'] = 0.0
+                spool_p1['filament_used_mm'] += temp_v_filament_used
+                self.last_v_filament_used = v_filament_used
+                update_spools = True
+                self.logger.info(f"Job updated with status '{status}': Added {v_filament_used}mm to P1 spool, v total filament used: {spool_p1['filament_used_mm']}mm")
         if update_spools:
             self._save_spools()
-            self.logger.info(f"Job finished with status '{status}': Updated spools data saved.")
-
-        for key, value in pstats.items():
-            self.logger.info(f"Job finished with status '{status}': {key} = {value}")
+            self.logger.info(f"Job updated with status '{status}': Updated spools data saved.")
+        for key, value in new_stats.items():
+            self.logger.info(f"Job updated with status '{status}': {key} = {value}")
 
     def _register_endpoints(self):
         """注册所有JSON-RPC端点"""
