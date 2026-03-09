@@ -519,7 +519,6 @@ class KlippyConnection:
                 if self._state == KlippyState.READY:
                     logging.info("Klippy ready")
                     await self.server.send_event("server:klippy_ready")
-                    self.recover_attempts = 0
                     if self._state == KlippyState.SHUTDOWN:
                         # Klippy shutdown during ready event
                         self.server.send_event("server:klippy_shutdown")
