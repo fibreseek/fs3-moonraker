@@ -1,9 +1,8 @@
 import logging
-import csv
 import re
 import os
 import time
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Tuple
 
 from ..confighelper import ConfigHelper
 from ..common import RequestType, WebRequest
@@ -13,36 +12,49 @@ from ..utils import ServerError
 DB_NAMESPACE = "moonraker"
 DB_LANGUAGE_KEY = "error_indexer.language"
 WEBHOOK_ERROR_STATES = ("shutdown", "error")
-CSV_ENCODINGS = ("gb2312", "gbk", "utf-8", "utf-8-sig", "gb18030")
+PLACEHOLDER_RE = re.compile(r"%(\d+)")
 
 
 class ErrorIndexer:
     def __init__(self, config: ConfigHelper) -> None:
         self.server = config.get_server()
         self.name = config.get_name()
+        # 获取数据库组件
         self.database = self.server.lookup_component("database")
+        # 获取 JSON-RPC 组件
         self.jsonrpc = self.server.lookup_component("jsonrpc")
-
-        self.csv_path = self._get_csv_path(config)
-        self.language = config.get("language", "en")
+        # 获取错误数据库文件路径
+        self.file_path = self._get_file_path(config)
+        # 默认读取 xlsx 中名为 "klipper" 的表格，可通过配置覆盖
+        self.sheet_name = config.get("sheet_name", "klipper")
+        # 获取语言设置
+        self.language = config.get("language", "en-US")
+        # 错误数据库
         self.error_db: Dict[str, Dict[str, Any]] = {}
-
+        # 加载错误数据库
         self._load_error_db()
         logging.info(
-            "Error Indexer: 组件已加载 (module=%s, csv_path=%s, language=%s, db_size=%d)",
-            __file__, self.csv_path, self.language, len(self.error_db)
+            "Error Indexer: 组件已加载 (module=%s, file_path=%s, language=%s, db_size=%d)",
+            __file__, self.file_path, self.language, len(self.error_db)
         )
-
+        # 注册事件处理程序
         self._register_handlers()
+        # 注册 REST API 端点
         self._register_endpoints()
+        # 注册 WebSocket 通知
         self._register_notifications()
+        # 挂钩 printer.gcode.script API
         self._hook_gcode_api()
 
-    def _get_csv_path(self, config: ConfigHelper) -> str:
-        default_csv = os.path.abspath(
-            os.path.join(os.path.dirname(__file__), "../../error_info.CSV")
+    def _get_file_path(self, config: ConfigHelper) -> str:
+        """xlsx 路径：优先 xlsx_path，其次 file_path、csv_path，最后默认 error_info.xlsx。"""
+        default_path = os.path.abspath(
+            os.path.join(os.path.dirname(__file__), "../../error_info.xlsx")
         )
-        return str(config.get("csv_path", default_csv))
+        return str(config.get(
+            "xlsx_path",
+            config.get("file_path", config.get("csv_path", default_path)),
+        ))
 
     # 注册事件处理程序
     def _register_handlers(self) -> None:
@@ -72,7 +84,6 @@ class ErrorIndexer:
         """组件初始化：从数据库恢复语言设置。"""
         await self._load_persisted_language()
 
-    # 从数据库恢复语言设置
     async def _load_persisted_language(self) -> None:
         try:
             stored_lang = await self.database.get_item(
@@ -84,7 +95,6 @@ class ErrorIndexer:
                 self.language, e
             )
             return
-
         if isinstance(stored_lang, str) and stored_lang:
             self.language = stored_lang
             logging.info("Error Indexer: 从数据库恢复语言设置为 %s", self.language)
@@ -99,132 +109,134 @@ class ErrorIndexer:
                 self.language, e
             )
 
-    # 挂钩 printer.gcode.script API 以捕获错误响应。
     def _hook_gcode_api(self) -> None:
         """挂钩 printer.gcode.script API 以捕获错误响应。"""
         method_info = self.jsonrpc.get_method("printer.gcode.script")
         if not method_info:
             return
-
         _, api_def = method_info
         orig_callback = api_def.callback
-
         async def wrapped_callback(web_request: WebRequest) -> Any:
             try:
                 return await orig_callback(web_request)
             except ServerError as e:
-                error_msg = str(e)
-                self._handle_gcode_response(f"!! {error_msg}")
+                self._handle_gcode_response(f"!! {str(e)}")
                 raise
-                
         api_def.callback = wrapped_callback
         logging.info("Error Indexer: 已挂钩 printer.gcode.script API")
 
-    def _csv_get(self, row: List[str], idx: int) -> str:
+    def _row_get(self, row: Tuple[Any, ...], idx: int) -> str:
+        """取行第 idx 列，转为 str 并 strip。"""
         if idx < len(row):
-            return row[idx].strip()
+            val = row[idx]
+            return str(val).strip() if val is not None else ""
         return ""
 
-    def _load_error_db(self) -> None:
-        """从 CSV 文件加载错误信息。"""
-        if not os.path.exists(self.csv_path):
-            logging.warning(f"Error Indexer: 在 {self.csv_path} 未找到 CSV 文件")
-            return
+    def _parse_placeholders(self, template: str) -> List[str]:
+        """从第二列模板按首次出现顺序解析占位符，如 ['%1','%2','%3']。"""
+        return list(dict.fromkeys(f"%{m.group(1)}" for m in PLACEHOLDER_RE.finditer(template)))
 
-        for encoding in CSV_ENCODINGS:
+    def _build_msg_re(self, template: str, placeholders: List[str]) -> Optional[re.Pattern]:
+        """构建匹配用正则：%N 首次出现为 (.*?)，再次出现为反向引用。re.escape 不转义 %，故按 %N 分割后分段转义。"""
+        if not template:
+            return None
+        if not placeholders:
             try:
-                logging.info(f"Error Indexer: 尝试使用 {encoding} 编码加载 CSV...")
-                with open(self.csv_path, 'r', encoding=encoding) as f:
-                    reader = csv.reader(f)
-                    self.error_db = {}
-                    header_skipped = False
-                    for row in reader:
-                        if not row:
-                            continue
-
-                        if not header_skipped:
-                            first_col = self._csv_get(row, 0)
-                            if first_col.startswith('\ufeff'):
-                                first_col = first_col[1:]
-                            
-                            if "Error Code" in first_col or "Code" in first_col:
-                                header_skipped = True
-                                continue
-
-                            if not first_col.isdigit():
-                                header_skipped = True
-                                continue
-
-                        if len(row) < 2:
-                            continue
-
-                        code = self._csv_get(row, 0)
-                        if code.startswith('\ufeff'):
-                            code = code[1:]
-                             
-                        if not code:
-                            continue
-
-                        entry = {
-                            'code': code,
-                            # 第二列：报错信息（模板/匹配）
-                            'msg_match': self._csv_get(row, 1),
-                            # 第三列：报错信息多语言
-                            'msg_multi': self._parse_multi_lang(self._csv_get(row, 2)),
-                            # 第四列：解决方法（多语言文字或单个网址）
-                            'solution_multi': self._parse_solution(self._csv_get(row, 3)),
-                        }
-                        self.error_db[code] = entry
-                        
-                if len(self.error_db) > 0:
-                    logging.info(f"Error Indexer: 使用 {encoding} 成功加载 {len(self.error_db)} 条错误记录。")
-                    return
+                return re.compile(re.escape(template), re.IGNORECASE)
+            except re.error:
+                return None
+        parts = re.split(r"(%\d+)", template)
+        group_for_ph: Dict[str, int] = {}
+        next_group = 1
+        result_parts: List[str] = []
+        for part in parts:
+            if PLACEHOLDER_RE.fullmatch(part):
+                ph = part
+                if ph in group_for_ph:
+                    result_parts.append("\\" + str(group_for_ph[ph]))
                 else:
-                    logging.warning(f"Error Indexer: 使用 {encoding} 解码成功但未找到有效记录。")
-                    continue
-                
-            except UnicodeDecodeError:
-                continue
-            except Exception as e:
-                logging.error(f"Error Indexer: 加载 CSV 失败 ({encoding}): {e}")
-                continue
+                    group_for_ph[ph] = next_group
+                    result_parts.append("(.*?)")
+                    next_group += 1
+            else:
+                result_parts.append(re.escape(part))
+        try:
+            return re.compile("".join(result_parts), re.IGNORECASE)
+        except re.error:
+            logging.warning("Error Indexer: Invalid regex from template: %s", template[:80])
+            return None
 
-        logging.error("Error Indexer: 所有编码尝试均失败，无法加载 CSV 文件。")
+    def _load_error_db(self) -> None:
+        """从 xlsx 指定 sheet 加载错误表（跳过首行）。"""
+        if not os.path.exists(self.file_path):
+            logging.warning("Error Indexer: 在 %s 未找到 xlsx 文件", self.file_path)
+            return
+        try:
+            from openpyxl import load_workbook
+        except ImportError:
+            logging.error("Error Indexer: 需要 openpyxl 才能读取 xlsx，请安装 openpyxl")
+            return
+        try:
+            wb = load_workbook(self.file_path, read_only=True, data_only=True)
+            if self.sheet_name not in wb.sheetnames:
+                logging.warning(
+                    "Error Indexer: xlsx 中未找到表格 %r，可用: %s",
+                    self.sheet_name, wb.sheetnames,
+                )
+                wb.close()
+                return
+            ws = wb[self.sheet_name]
+            self.error_db = {}
+            # 无论内容如何都先跳过第一行（表头）
+            for row in ws.iter_rows(min_row=2, values_only=True):
+                row = tuple(row) if row else ()
+                if not row:
+                    continue
+                code = self._row_get(row, 0)
+                if code.startswith("\ufeff"):
+                    code = code[1:]
+                if len(row) < 2:
+                    continue
+                if not code:
+                    continue
+                msg_match = self._row_get(row, 1)
+                placeholders = self._parse_placeholders(msg_match)
+                msg_re = self._build_msg_re(msg_match, placeholders)
+                entry = {
+                    "code": code,
+                    "msg_match": msg_match,
+                    "placeholders": placeholders,
+                    "msg_re": msg_re,
+                    "msg_multi": self._parse_multi_lang(self._row_get(row, 2)),
+                    "solution_multi": self._parse_solution(self._row_get(row, 3)),
+                }
+                self.error_db[code] = entry
+            wb.close()
+            if self.error_db:
+                logging.info(
+                    "Error Indexer: 从 xlsx 成功加载 %d 条错误记录。",
+                    len(self.error_db),
+                )
+        except Exception as e:
+            logging.error("Error Indexer: 加载 xlsx 失败: %s", e)
 
     def _parse_multi_lang(self, text: str) -> Dict[str, str]:
-        """解析多语言字符串，支持 'zh:内容' 或 'zh：内容'。"""
+        """解析多语言字符串，支持 xx-XX: 或 xx-XX： 开头，每行一种语言。"""
         if not text:
             return {}
-            
+        text = text.replace("：", ":").replace("\r\n", "\n")
+        # 按「语言行」切分，成对得到 (lang, content)
+        parts = re.split(r"(?m)^([A-Za-z]{2}[-_][A-Za-z]{2}):", text)
         result = {}
-        text = text.replace('：', ':')
-        lines = text.replace('\r\n', '\n').split('\n')
-        current_lang = 'en'
-        buffer = []
-        
-        for line in lines:
-            line = line.strip()
-            # 仅支持 ISO 639-1 + ISO 3166-1（如 zh-CN/en-US）
-            match = re.match(r'^([A-Za-z]{2}[-_][A-Za-z]{2}):', line)
-            if match:
-                if buffer and current_lang:
-                    result[current_lang] = '\n'.join(buffer).strip()
-                current_lang = self._normalize_locale(match.group(1))
-                buffer = [line[len(match.group(0)):].strip()]
-            else:
-                buffer.append(line)
-        
-        if buffer and current_lang:
-            result[current_lang] = '\n'.join(buffer).strip()
-            
+        for i in range(1, len(parts), 2):
+            if i + 1 < len(parts):
+                lang = self._normalize_locale(parts[i].strip())
+                if lang:
+                    result[lang] = parts[i + 1].strip()
         return result
 
     def _normalize_locale(self, locale: str) -> str:
-        """
-        规范化语言标识：
-        - 仅支持 ISO 639-1 + ISO 3166-1：如 zh-CN / en-US（以及 zh_CN 形式）
-        规则：language 小写，region 大写，分隔符统一为 '-'
-        """
+        """规范化为 xx-XX（小写语言+大写地区，如 zh-CN / en-US）。"""
         raw = (locale or "").strip()
         if not raw:
             return ""
@@ -241,135 +253,97 @@ class ErrorIndexer:
         return f"{language}-{region}"
 
     def _locale_candidates(self, locale: str) -> List[str]:
-        """
-        返回候选 locale 列表，用于在同一多语言列内做兼容回退：
-        - 仅精确 locale（如 zh-CN），不兼容旧格式，也不做语言级回退
-        """
+        """返回候选 locale 列表（当前仅精确匹配，如 zh-CN）。"""
         norm = self._normalize_locale(locale)
-        if not norm:
-            return []
-        return [norm]
+        return [norm] if norm else []
 
     def _parse_solution(self, text: str) -> Dict[str, str]:
-        """
-        解析解决方法列：
-        - 多语言文字：de：...\nit：...\nzh：...
-        - 或单个网址：https://...
-        """
+        """解析解决方法列：多语言（同 _parse_multi_lang）或单个 http(s) 链接。"""
         raw = (text or "").strip()
         if not raw:
             return {}
-        if raw.startswith("http://") or raw.startswith("https://"):
-            # 单个链接视为通用解决方案，使用标准 locale key
+        if raw.startswith(("http://", "https://")):
             return {"en-US": raw}
         return self._parse_multi_lang(raw)
 
-    # 根据错误消息在 CSV 数据库中匹配错误码。
-    def _match_error_code(self, message: str) -> Optional[str]:
-        """
-        根据错误消息在 CSV 数据库中匹配错误码。
-
-        使用第二列 msg_match 作为模板，通过正则归一化数字和占位符。
-        """
-        matched_code: Optional[str] = None
+    def _match_error_code(self, message: str) -> Optional[Tuple[str, Tuple[str, ...]]]:
+        """匹配错误消息，返回 (code, 占位符捕获值) 或 None。"""
         for code, entry in self.error_db.items():
-            db_msg = entry.get('msg_match', '').strip()
-            if not db_msg:
+            msg_re = entry.get("msg_re")
+            if msg_re is None:
                 continue
-
-            # 1. 数字归一化为占位符
-            pattern_str = re.sub(r'[\d\.\-]+', r'___NUM___', db_msg)
-            # 2. 转义普通字符
-            pattern_str = re.escape(pattern_str)
-            # 3. 还原数字占位符为通用正则
-            pattern_str = pattern_str.replace(r'___NUM___', r'[\d\.\-]+')
-            # 4. 处理 %s / %d / %f 占位符
-            pattern_str = (
-                pattern_str
-                .replace("%s", r".*?")
-                .replace("%d", r"\d+")
-                .replace("%f", r"[\d\.]+")
-            )
-
-            try:
-                if re.search(pattern_str, message, re.IGNORECASE):
-                    matched_code = code
-                    break
-            except re.error:
-                logging.warning(
-                    f"Error Indexer: Invalid regex pattern from CSV: {pattern_str}"
-                )
+            m = msg_re.search(message)
+            if not m:
                 continue
+            groups = m.groups() if m.lastindex else ()
+            return (code, groups)
+        return None
 
-        return matched_code
-
-    # 处理传入的 G-code 响应。
     def _handle_gcode_response(self, response: str) -> None:
-        """处理传入的 G-code 响应。"""
+        """处理 G-code 响应，!! 开头视为标准错误并匹配。"""
         logging.debug(f"Error Indexer 收到响应: {response}")
 
         clean_response = response.strip()
-        is_standard_error = clean_response.startswith("!!")
-        
-        if is_standard_error:
-            clean_msg = clean_response[2:].strip()
-        else:
-            clean_msg = clean_response
-
-        matched_code = self._match_error_code(clean_msg)
-        
-        if matched_code:
-            self._process_error(clean_msg, response, matched_code)
-        elif is_standard_error:
-            logging.info(
-                "Error Indexer: 标准错误未命中 CSV，按 UNKNOWN 处理: %s",
-                clean_msg
-            )
+        clean_msg = clean_response[2:].strip() if clean_response.startswith("!!") else clean_response
+        match_result = self._match_error_code(clean_msg)
+        if match_result:
+            code, groups = match_result
+            self._process_error(clean_msg, response, code=code, placeholder_values=groups)
+        elif clean_response.startswith("!!"):
+            logging.info("Error Indexer: 标准错误未命中数据库，按 UNKNOWN 处理: %s", clean_msg)
             self._process_error(clean_msg, response, None)
 
-    # 处理来自 server:status_update 的状态通知。
     async def _handle_status_update(self, status: Dict[str, Any]) -> None:
-        """
-        处理来自 server:status_update 的状态通知。
-
-        当 webhooks.state 为 shutdown/error 时，提取 state_message 发送通知。
-        """
+        """webhooks.state 为 shutdown/error 时，用 state_message 匹配并通知。"""
         wh = status.get("webhooks")
         if not isinstance(wh, dict):
             return
-
         state = wh.get("state")
         if state not in WEBHOOK_ERROR_STATES:
             return
-
         state_message = wh.get("state_message", "")
         if not state_message:
             return
-
-        matched_code = self._match_error_code(state_message)
+        match_result = self._match_error_code(state_message)
         original_response = f"webhooks.state={state}, state_message={state_message}"
-        self._process_error(state_message, original_response, matched_code)
+        if match_result:
+            code, groups = match_result
+            self._process_error(state_message, original_response, code=code, placeholder_values=groups)
+        else:
+            self._process_error(state_message, original_response, None)
 
-    # 处理检测到的错误。
-    def _process_error(self, error_msg: str, original_response: str, code: Optional[str] = None) -> None:
+    def _process_error(
+        self,
+        error_msg: str,
+        original_response: str,
+        code: Optional[str] = None,
+        placeholder_values: Optional[Tuple[str, ...]] = None,
+    ) -> None:
         """处理检测到的错误。"""
         if not code:
-            for c, entry in self.error_db.items():
-                if entry.get('msg_match') and entry.get('msg_match') in error_msg:
-                    code = c
-                    break
-        
+            match_result = self._match_error_code(error_msg)
+            if match_result:
+                code, placeholder_values = match_result
+            else:
+                for c, ent in self.error_db.items():
+                    msg_match = ent.get("msg_match")
+                    if msg_match and msg_match in error_msg:
+                        code = c
+                        break
         if not code:
             code = "UNKNOWN"
+        if placeholder_values is None:
+            placeholder_values = ()
 
         entry = self.error_db.get(code, {})
-        
-        # 根据语言获取描述和解决方案
+
         if code == "UNKNOWN":
             description = error_msg
             solution = ""
         else:
-            description = self._get_description(entry, self.language)
+            description = self._get_description(
+                entry, self.language, placeholder_values=placeholder_values
+            )
             solution = self._get_solution(entry, self.language)
         
         payload = {
@@ -384,35 +358,40 @@ class ErrorIndexer:
         self.server.send_event("error_indexer:error_detected", payload)
         logging.info(f"Error Indexer: 检测到错误 {code} - {error_msg}")
 
-    def _get_description(self, entry: Dict[str, Any], lang: str) -> str:
-        msg_multi = entry.get('msg_multi', {}) or {}
+    def _get_description(
+        self,
+        entry: Dict[str, Any],
+        lang: str,
+        placeholder_values: Optional[Tuple[str, ...]] = None,
+    ) -> str:
+        """获取错误描述。"""
+        msg_multi = entry.get("msg_multi", {}) or {}
         for cand in self._locale_candidates(lang):
-            value = msg_multi.get(cand, "")
-            if value:
-                return value
+            template = msg_multi.get(cand, "")
+            if not template:
+                continue
+            if placeholder_values and entry.get("placeholders"):
+                placeholders = entry["placeholders"]
+                filled = template
+                for i, ph in enumerate(placeholders):
+                    if i < len(placeholder_values) and ph in filled:
+                        filled = filled.replace(ph, placeholder_values[i])
+                return filled
+            return template
         return ""
 
     def _get_solution(self, entry: Dict[str, Any], lang: str) -> str:
-        sol_multi = entry.get('solution_multi', {}) or {}
+        """获取解决方法：当前语言 → en-US 兜底 → 任意非空。"""
+        sol_multi = entry.get("solution_multi", {}) or {}
         for cand in self._locale_candidates(lang):
-            value = sol_multi.get(cand, "")
-            if value:
-                return value
-
-        # 英文兜底优先顺序：en-US
-        for cand in ("en-US",):
-            value = sol_multi.get(cand, "")
-            if value:
-                return value
-
-        # 最后兜底返回任意非空值
-        for val in sol_multi.values():
-            if val:
-                return val
-        return ""
+            if sol_multi.get(cand, ""):
+                return sol_multi[cand]
+        if sol_multi.get("en-US", ""):
+            return sol_multi["en-US"]
+        return next((v for v in sol_multi.values() if v), "")
 
     async def _handle_config_update(self, web_request: WebRequest) -> Dict[str, Any]:
-        """更新配置的 API。"""
+        """POST 更新语言等配置。"""
         lang = web_request.get_str("language", None)
         if lang:
             normalized = self._normalize_locale(lang)
