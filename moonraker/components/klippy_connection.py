@@ -108,7 +108,7 @@ class KlippyConnection:
         
         # Auto-recovery configuration
         self.auto_recover = config.getboolean('auto_recover_on_shutdown', False)
-        self.max_recover_attempts = config.getint('max_recover_attempts', 2)
+        self.max_recover_attempts = config.getint('max_recover_attempts', 3)
         self.recover_delay = config.getfloat('recover_delay', 3.0)
         self.recover_reset_timeout = config.getfloat('recover_reset_timeout', 600.0)  # 10 minutes
         self.recover_attempts = 0
@@ -478,6 +478,24 @@ class KlippyConnection:
                 ):
                     # Klippy shutdown during startup event
                     self.server.send_event("server:klippy_shutdown")
+                    # Check if we should attempt auto-recovery
+                    logging.info(f"Scheduling auto-recovery attempt in {self.recover_delay} seconds")
+                    try:
+                        if self._auto_recover_task is not None and not self._auto_recover_task.done():
+                            self._auto_recover_task.cancel()
+                    except Exception:
+                        pass
+                    self._auto_recover_task = self.event_loop.create_task(
+                        self._delayed_auto_recovery(self.recover_delay)
+                    )
+                elif self._state == KlippyState.ERROR:
+                    logging.error(
+                        "Klippy state transition to ERROR during init, "
+                        f"new state: {self._state}"
+                    )
+                    self.server.send_event("server:klippy_error")
+                    self._klippy_initializing = False
+                    
                     # Check if we should attempt auto-recovery
                     logging.info(f"Scheduling auto-recovery attempt in {self.recover_delay} seconds")
                     try:

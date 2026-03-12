@@ -259,35 +259,51 @@ class KlippyAPI(APITransport):
         # 打印前异物检测
         if not skip_foreign_detect:
             try:
-                ai_detection = self.server.lookup_component("ai_detection")
-                # 检查总开关和异物检测开关
-                if ai_detection.is_foreign_detect_enabled():
-                    result = await ai_detection.detect_foreign_object(
-                        send_notification=True  # 发送通知
+                # 检查组件是否加载失败
+                if "ai_detection" in self.server.failed_components:
+                    raise self.server.error(
+                        "AI Detection component failed to load, foreign object detection unavailable",
+                        503
                     )
-
-                    if result.is_valid and result.has_object:
-                        # 检测有效且有异物，抛出错误阻止打印启动
-                        class_names = result.class_names if result.class_names else []
-                        objects_str = ", ".join(class_names) if class_names else "unknown objects"
-                        logging.warning(
-                            f"AI Detection: Foreign object detected: {objects_str}, blocking print start"
-                        )
-                        raise self.server.error(
-                            "Foreign object detected, please confirm before printing",
-                            403
-                        )
-                    elif result.is_valid and not result.has_object:
-                        # 检测有效且无异物，继续打印
-                        logging.info("AI Detection: No foreign objects detected, proceeding with print")
-                    else:
-                        # 检测无效（可能未连接），记录警告但继续打印
-                        logging.warning(
-                            "AI Detection: Foreign object detection not available, "
-                            "proceeding with print anyway"
-                        )
+                ai_detection = self.server.lookup_component("ai_detection")
+                # 检查总开关，未启用则跳过检测
+                if not ai_detection.is_enabled():
+                    logging.info("AI Detection is disabled, skipping foreign object detection")
                 else:
-                    logging.info("AI Detection: Foreign object detection disabled, skipping...")
+                    # 检查连接状态
+                    if not ai_detection.is_connected:
+                        raise self.server.error(
+                            "AI Detection service is not connected",
+                            503
+                        )
+                    # 检查总开关和异物检测开关
+                    if ai_detection.is_foreign_detect_enabled():
+                        result = await ai_detection.detect_foreign_object(
+                            send_notification=True  # 发送通知
+                        )
+
+                        if result.is_valid and result.has_object:
+                            # 检测有效且有异物，抛出错误阻止打印启动
+                            class_names = result.class_names if result.class_names else []
+                            objects_str = ", ".join(class_names) if class_names else "unknown objects"
+                            logging.warning(
+                                f"AI Detection: Foreign object detected: {objects_str}, blocking print start"
+                            )
+                            raise self.server.error(
+                                "Foreign object detected, please confirm before printing",
+                                403
+                            )
+                        elif result.is_valid and not result.has_object:
+                            # 检测有效且无异物，继续打印
+                            logging.info("AI Detection: No foreign objects detected, proceeding with print")
+                        else:
+                            # 检测无效（可能未连接），记录警告但继续打印
+                            logging.warning(
+                                "AI Detection: Foreign object detection not available, "
+                                "proceeding with print anyway"
+                            )
+                    else:
+                        logging.info("AI Detection: Foreign object detection disabled, skipping...")
             except self.server.error:
                 raise  # 重新抛出 server.error
             except Exception as e:

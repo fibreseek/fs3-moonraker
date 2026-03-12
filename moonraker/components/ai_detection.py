@@ -348,7 +348,7 @@ class CoordinatorConfig:
     def from_config(cls, config: "ConfigHelper") -> "CoordinatorConfig":
         """从配置文件加载配置"""
         return cls(
-            enable=config.getboolean("enable", True),
+            enable=config.getboolean("enable", False),
             enable_foreign_detect=config.getboolean(
                 "enable_foreign_detect", True
             ),
@@ -515,6 +515,10 @@ class AIDetectionClient:
         if self.auto_connect:
             logging.info("AI Detection: Auto-connecting to server...")
             self._connect_task = self.eventloop.create_task(self._do_connect())
+
+    def is_enabled(self) -> bool:
+        """检查 AI 检测总开关是否启用（不考虑连接状态）"""
+        return self.coordinator_config.enable
 
     def is_foreign_detect_enabled(self) -> bool:
         """检查是否启用异物检测"""
