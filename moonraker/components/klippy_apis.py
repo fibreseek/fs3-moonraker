@@ -92,6 +92,7 @@ class KlippyAPI(APITransport):
         return await self.cancel_print()
 
     async def _gcode_start_print(self, web_request: WebRequest) -> str:
+        logging.info(" enter _gcode_start_print")
         filename: str = web_request.get_str('filename')
         user = web_request.get_current_user()
         auto_leveling: bool = web_request.get_boolean('auto_leveling', False)
@@ -180,6 +181,7 @@ class KlippyAPI(APITransport):
         # Doing so will result in "wait_started" blocking for the specifed
         # timeout (default 20s) and returning False.
         # XXX - validate that file is on disk
+        logging.info(" enter start_print")
         if filename[0] == '/':
             filename = filename[1:]
 
@@ -243,7 +245,7 @@ class KlippyAPI(APITransport):
             for cmd in save_commands:
                 try:
                     await self.run_gcode(cmd)
-                    logging.debug(f"Executed: {cmd}")
+                    logging.info(f"Executed: {cmd}")
                 except Exception as e:
                     logging.warning(f"Failed to execute command '{cmd}': {e}")
         else:
@@ -301,6 +303,7 @@ class KlippyAPI(APITransport):
         ret = await self.run_gcode(script)
 
         self.server.send_event("klippy_apis:job_start_complete", user)
+        logging.info(" leave start_print")
         return ret
 
 

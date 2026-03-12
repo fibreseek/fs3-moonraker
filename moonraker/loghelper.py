@@ -142,7 +142,7 @@ class LogManager:
                     formatter: logging.Formatter = StructuredFormatter()
                 else:
                     formatter = logging.Formatter(
-                        '%(asctime)s [%(filename)s:%(funcName)s()] - %(message)s'
+                        '%(asctime)s %(levelname)s %(filename)s %(funcName)s %(lineno)d %(threadName)s - %(message)s'
                     )
                 self.file_hdlr.setFormatter(formatter)
                 self.listener = logging.handlers.QueueListener(

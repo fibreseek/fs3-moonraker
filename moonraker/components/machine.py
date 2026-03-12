@@ -95,6 +95,14 @@ class Machine:
             self._sudo_password = sudo_template.render()
         self._public_ip = ""
         self.machine_id: Optional[str] = ""
+
+        self.database: MoonrakerDatabase = self.server.lookup_component("database")
+        # Parameter management
+        self._parameters: Dict[str, Any] = {}
+        self._parameter_subscriptions: Dict[str, Set[Any]] = {}
+        self._param_lock = asyncio.Lock()
+        # Load machine_name from database
+        self._load_parameters()
         self.system_info: Dict[str, Any] = {
             'python': {
                 "version": tuple(sys.version_info),
@@ -165,6 +173,20 @@ class Machine:
             "/machine/peripherals/video", RequestType.GET, self._handle_video_request
         )
 
+        # Register parameter management endpoints
+        self.server.register_endpoint(
+            "/printer/get_parameters", RequestType.GET, self._handle_get_parameters
+        )
+        self.server.register_endpoint(
+            "/printer/set_parameters", RequestType.POST, self._handle_set_parameters
+        )
+        self.server.register_endpoint(
+            "/printer/subscribe_parameters", RequestType.POST, self._handle_subscribe_parameters
+        )
+        self.server.register_endpoint(
+            "/printer/unsubscribe_parameters", RequestType.POST, self._handle_unsubscribe_parameters
+        )
+
         self.server.register_notification("machine:service_state_changed")
         self.server.register_notification("machine:sudo_alert")
 
@@ -184,6 +206,18 @@ class Machine:
         self.iwgetid_cmd = shell_cmd.build_shell_command(iwgetbin)
         self.init_evt = asyncio.Event()
         self.libcam = self._try_import_libcamera()
+
+    def _load_parameters(self) -> None:
+        """Load parameters from database"""
+        try:
+            # Load machine_name from database, default to "fibre seek printer"
+            machine_name = self.database.get_item("moonraker", "machine_name")
+            self._parameters["machine_name"] = machine_name
+        except Exception as e:
+            logging.exception(f"Failed to load parameters: {e}")
+            # Set default value if database loading fails
+            self._parameters["machine_name"] = "fibre seek printer"
+            self.database.insert_item("moonraker", "machine_name", "fibre seek printer")
 
     def _init_allowed_services(self) -> None:
         app_args = self.server.get_app_args()
@@ -452,8 +486,154 @@ class Machine:
     async def _handle_video_request(self, web_request: WebRequest) -> Dict[str, Any]:
         return await self.detect_video_devices()
 
+    async def _handle_get_parameters(self, web_request: WebRequest) -> Dict[str, Any]:
+        """Handle printer.get_parameters request"""
+        params = web_request.get_args()
+        requested_params = params.keys()
+        result = {}
+        
+        for param_name in requested_params:
+            if param_name == "machine_name":
+                result[param_name] = self.get_machine_name()
+            else:
+                # Handle other parameters in the future
+                result[param_name] = None
+        
+        return result
+
+    async def _handle_set_parameters(self, web_request: WebRequest) -> Dict[str, Any]:
+        """Handle printer.set_parameters request"""
+        params = web_request.get_args()
+        results = {}
+        all_successful = True
+        
+        for param_name, value in params.items():
+            try:
+                if param_name == "machine_name":
+                    await self.set_machine_name(value)
+                    results[param_name] = {"success": True, "message": "Parameter updated successfully"}
+                else:
+                    # Handle other parameters in the future
+                    results[param_name] = {"success": False, "message": "Parameter not supported"}
+                    all_successful = False
+            except Exception as e:
+                results[param_name] = {"success": False, "message": str(e)}
+                all_successful = False
+        results["all_success"] = all_successful
+        return results
+
+    async def _handle_subscribe_parameters(self, web_request: WebRequest) -> Dict[str, Any]:
+        """Handle printer.subscribe_parameters request"""
+        params = web_request.get_args()
+        conn = web_request.get_subscribable()
+        
+        if conn is None:
+            raise self.server.error("Subscription requires a persistent connection", 400)
+        
+        for param_name in params.keys():
+            if param_name == "machine_name":
+                self.subscribe_parameter(param_name, conn)
+            else:
+                # Handle other parameters in the future
+                pass
+        
+        # Return current values of subscribed parameters
+        current_values = {}
+        for param_name in params.keys():
+            if param_name == "machine_name":
+                current_values[param_name] = self.get_machine_name()
+        
+        return current_values
+
+    async def _handle_unsubscribe_parameters(self, web_request: WebRequest) -> Dict[str, Any]:
+        """Handle printer.unsubscribe_parameters request"""
+        params = web_request.get_args()
+        conn = web_request.get_subscribable()
+        
+        if conn is None:
+            raise self.server.error("Unsubscription requires a persistent connection", 400)
+        
+        for param_name in params.keys():
+            if param_name == "machine_name":
+                self.unsubscribe_parameter(param_name, conn)
+            else:
+                # Handle other parameters in the future
+                pass
+        
+        return {"result": "ok"}
+
     def get_system_info(self) -> Dict[str, Any]:
         return self.system_info
+
+    def get_machine_name(self) -> str:
+        """Get the current machine name"""
+        return self._parameters.get("machine_name", "fibre seek printer")
+
+    async def set_machine_name(self, new_value: str) -> None:
+        """Set the machine name and persist it to database"""
+        # Validate input
+        if not new_value or not isinstance(new_value, str):
+            raise self.server.error("Machine name must be a non-empty string", 400)
+        if len(new_value) > 100:
+            raise self.server.error("Machine name must be less than 100 characters", 400)
+        
+        async with self._param_lock:
+            # Update the value
+            old_value = self._parameters.get("machine_name")
+            if old_value == new_value:
+                return  # No change needed
+            
+            # Persist to database
+            try:
+                await self.database.update_item("moonraker", "machine_name", new_value)
+                # Update in memory
+                self._parameters["machine_name"] = new_value
+                # Send notification to subscribers
+                await self._notify_parameter_changed("machine_name", new_value)
+            except Exception as e:
+                logging.exception(f"Failed to set machine name: {e}")
+                raise self.server.error(f"Failed to set machine name: {str(e)}", 500)
+
+    async def _notify_parameter_changed(self, param_name: str, new_value: Any) -> None:
+        """Notify subscribers of parameter changes"""
+        subscribers = self._parameter_subscriptions.get(param_name, set())
+        if not subscribers:
+            return
+        
+        # Create notification message
+        notification = {
+            "jsonrpc": "2.0",
+            "method": "notify_printer_parameters_changed",
+            "params": {param_name: new_value}
+        }
+        
+        # Send notification to all subscribers
+        for conn in subscribers:
+            try:
+                await conn.send_json(notification)
+            except Exception as e:
+                logging.exception(f"Failed to send parameter notification: {e}")
+                # Remove invalid connection
+                self._parameter_subscriptions[param_name].discard(conn)
+
+    def subscribe_parameter(self, param_name: str, connection: Any) -> None:
+        """Subscribe to parameter changes"""
+        if param_name not in self._parameter_subscriptions:
+            self._parameter_subscriptions[param_name] = set()
+        self._parameter_subscriptions[param_name].add(connection)
+
+    def unsubscribe_parameter(self, param_name: str, connection: Any) -> None:
+        """Unsubscribe from parameter changes"""
+        if param_name in self._parameter_subscriptions:
+            self._parameter_subscriptions[param_name].discard(connection)
+
+    def remove_subscriber(self, connection: Any) -> None:
+        """Remove a connection from all subscriptions"""
+        for param_name, subscribers in list(self._parameter_subscriptions.items()):
+            if connection in subscribers:
+                subscribers.remove(connection)
+            if not subscribers:
+                del self._parameter_subscriptions[param_name]
 
     @property
     def sudo_password(self) -> Optional[str]:
@@ -848,14 +1028,13 @@ class Machine:
 
     async def update_usb_ids(self, force: bool = False) -> None:
         async with self.periph_lock:
-            db: MoonrakerDatabase = self.server.lookup_component("database")
             client: HttpClient = self.server.lookup_component("http_client")
             dpath = pathlib.Path(self.server.get_app_arg("data_path"))
             usb_ids_path = pathlib.Path(dpath).joinpath("misc/usb.ids")
             if usb_ids_path.is_file() and not force:
                 return
             usb_id_req_info: Dict[str, str]
-            usb_id_req_info = await db.get_item("moonraker", "usb_id_req_info", {})
+            usb_id_req_info = await self.database.get_item("moonraker", "usb_id_req_info", {})
             etag: Optional[str] = usb_id_req_info.pop("etag", None)
             last_modified: Optional[str] = usb_id_req_info.pop("last_modified", None)
             headers = {"Accept": "text/plain"}
@@ -878,7 +1057,7 @@ class Machine:
                 usb_id_req_info["etag"] = resp.etag
             if resp.last_modified is not None:
                 usb_id_req_info["last_modifed"] = resp.last_modified
-            await db.insert_item("moonraker", "usb_id_req_info", usb_id_req_info)
+            await self.database.insert_item("moonraker", "usb_id_req_info", usb_id_req_info)
             # Write file
             logging.info("Writing usb.ids file...")
             eventloop = self.server.get_event_loop()
