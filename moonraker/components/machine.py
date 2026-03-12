@@ -101,8 +101,8 @@ class Machine:
         self._parameters: Dict[str, Any] = {}
         self._parameter_subscriptions: Dict[str, Set[Any]] = {}
         self._param_lock = asyncio.Lock()
-        # Load machine_name from database
-        self._load_parameters()
+        # Initialize machine_name with default value, will be overwritten by _load_parameters
+        self._parameters["machine_name"] = "fibre seek printer"
         self.system_info: Dict[str, Any] = {
             'python': {
                 "version": tuple(sys.version_info),
@@ -186,6 +186,10 @@ class Machine:
         self.server.register_endpoint(
             "/printer/unsubscribe_parameters", RequestType.POST, self._handle_unsubscribe_parameters
         )
+        
+        self.server.register_endpoint(
+            "/machine/logs/download", RequestType.GET, self._handle_log_download
+        )
 
         self.server.register_notification("machine:service_state_changed")
         self.server.register_notification("machine:sudo_alert")
@@ -207,17 +211,19 @@ class Machine:
         self.init_evt = asyncio.Event()
         self.libcam = self._try_import_libcamera()
 
-    def _load_parameters(self) -> None:
+    async def _load_parameters(self) -> None:
         """Load parameters from database"""
         try:
             # Load machine_name from database, default to "fibre seek printer"
-            machine_name = self.database.get_item("moonraker", "machine_name")
+            machine_name = await self.database.get_item("moonraker", "machine_name")
+            logging.info(f"machine_name in batabase: {machine_name}")
             self._parameters["machine_name"] = machine_name
+            # Notify other components of the change
+            self.server.send_event("machine:machine_name_changed", self._parameters["machine_name"])
         except Exception as e:
-            logging.exception(f"Failed to load parameters: {e}")
+            logging.info(f"Failed to load parameters: {e}")
             # Set default value if database loading fails
-            self._parameters["machine_name"] = "fibre seek printer"
-            self.database.insert_item("moonraker", "machine_name", "fibre seek printer")
+            await self.database.insert_item("moonraker", "machine_name", self._parameters["machine_name"])
 
     def _init_allowed_services(self) -> None:
         app_args = self.server.get_app_args()
@@ -314,6 +320,8 @@ class Machine:
     async def component_init(self) -> None:
         eventloop = self.server.get_event_loop()
         eventloop.create_task(self.update_usb_ids())
+        # Load parameters from database
+        await self._load_parameters()
         await self.validator.validation_init()
         await self.sys_provider.initialize()
         if not self.inside_container:
@@ -561,6 +569,54 @@ class Machine:
                 pass
         
         return {"result": "ok"}
+    
+    async def _handle_log_download(self, web_request: WebRequest) -> Dict[str, Any]:
+        """Handle machine.logs.download request"""
+        import zipfile
+        import tempfile
+        import time
+        
+        # Define the logs directory path
+        logs_dir = "/home/anisoprint/printer_data/logs"
+        
+        # Check if the logs directory exists
+        if not os.path.exists(logs_dir) or not os.path.isdir(logs_dir):
+            raise self.server.error(f"Logs directory not found: {logs_dir}")
+        
+        # Create a temporary zip file
+        suffix = time.strftime("%Y%m%d-%H%M%S", time.localtime())
+        zip_filename = f"logs-{suffix}.zip"
+        
+        temp_dir = tempfile.gettempdir()
+        zip_path = os.path.join(temp_dir, zip_filename)
+        
+        try:
+            # Create zip file and add all files from the logs directory
+            with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+                for root, _, files in os.walk(logs_dir):
+                    for file in files:
+                        file_path = os.path.join(root, file)
+                        # Calculate relative path for the zip archive
+                        rel_path = os.path.relpath(file_path, logs_dir)
+                        zf.write(file_path, rel_path)
+            
+            # Get file size
+            file_size = os.path.getsize(zip_path)
+            
+            # Register a temporary static file handler for the zip file
+            app = self.server.lookup_component("application")
+            temp_log_path = f"temp_logs/{zip_filename}"
+            app.register_static_file_handler(temp_log_path, zip_path, force=True)
+            
+            # Return the zip file as a downloadable resource
+            return {
+                "filename": zip_filename,
+                "size": file_size,
+                "url": f"/server/files/{temp_log_path}"
+            }
+        except Exception as e:
+            logging.exception(f"Error creating log archive: {e}")
+            raise self.server.error(f"Failed to create log archive: {str(e)}")
 
     def get_system_info(self) -> Dict[str, Any]:
         return self.system_info
@@ -588,6 +644,8 @@ class Machine:
                 await self.database.update_item("moonraker", "machine_name", new_value)
                 # Update in memory
                 self._parameters["machine_name"] = new_value
+                # Notify other components of the change
+                self.server.send_event("machine:machine_name_changed", new_value)
                 # Send notification to subscribers
                 await self._notify_parameter_changed("machine_name", new_value)
             except Exception as e:
