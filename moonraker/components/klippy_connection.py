@@ -663,8 +663,8 @@ class KlippyConnection:
                 # Add machine_name field from parameter system
                 try:
                     machine = self.server.lookup_component("machine")
-                    machine_name = machine.get_machine_name()
-                    result["machine_name"] = machine_name
+                    result["machine_name"] = machine.get_machine_name()
+                    result["machine_id"] = machine.get_machine_id()
                 except Exception:
                     # If failed to get machine name, just skip adding the field
                     pass

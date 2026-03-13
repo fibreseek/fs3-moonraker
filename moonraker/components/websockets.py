@@ -214,6 +214,20 @@ class WebsocketManager:
                 continue
             sc.queue_message(msg)
 
+    def notify_specified_clients(
+        self,
+        name: str,
+        data: Union[List, Tuple] = [],
+        client_ids: List[int] = []
+    ) -> None:
+        msg: Dict[str, Any] = {'jsonrpc': "2.0", 'method': "notify_" + name}
+        if data:
+            msg['params'] = data
+        for sc in list(self.clients.values()):
+            if sc.uid not in client_ids or sc.need_auth:
+                continue
+            sc.queue_message(msg)
+
     def get_count(self) -> int:
         return len(self.clients)
 

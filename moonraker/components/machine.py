@@ -20,6 +20,8 @@ import distro
 import tempfile
 import getpass
 import configparser
+import hashlib
+import uuid
 from ..confighelper import FileSourceWrapper
 from ..utils import source_info, cansocket, sysfs_devs, load_system_module
 from ..utils import json_wrapper as jsonw
@@ -77,6 +79,7 @@ USB_IDS_URL = "http://www.linux-usb.org/usb.ids"
 
 class Machine:
     def __init__(self, config: ConfigHelper) -> None:
+        self.config = config
         self.server = config.get_server()
         self._allowed_services: List[str] = []
         self._init_allowed_services()
@@ -94,15 +97,13 @@ class Machine:
         if sudo_template is not None:
             self._sudo_password = sudo_template.render()
         self._public_ip = ""
-        self.machine_id: Optional[str] = ""
 
         self.database: MoonrakerDatabase = self.server.lookup_component("database")
-        # Parameter management
+        # Machine info parameters
         self._parameters: Dict[str, Any] = {}
-        self._parameter_subscriptions: Dict[str, Set[Any]] = {}
-        self._param_lock = asyncio.Lock()
-        # Initialize machine_name with default value, will be overwritten by _load_parameters
+        # Initialize machine_name with default value
         self._parameters["machine_name"] = "fibre seek printer"
+        self._parameters["machine_id"] = self._gen_machine_id()
         self.system_info: Dict[str, Any] = {
             'python': {
                 "version": tuple(sys.version_info),
@@ -131,10 +132,6 @@ class Machine:
         logging.info(f"Using System Provider: {self.provider_type}")
         self.validator = InstallValidator(config)
         self.sudo_requests: List[Tuple[SudoCallback, str]] = []
-        # Register event handler for Klipper ready
-        self.server.register_event_handler(
-            "server:klippy_ready", self._on_klippy_ready
-        )
 
         self.server.register_endpoint(
             "/machine/reboot", RequestType.POST, self._handle_machine_request
@@ -173,24 +170,6 @@ class Machine:
             "/machine/peripherals/video", RequestType.GET, self._handle_video_request
         )
 
-        # Register parameter management endpoints
-        self.server.register_endpoint(
-            "/printer/get_parameters", RequestType.GET, self._handle_get_parameters
-        )
-        self.server.register_endpoint(
-            "/printer/set_parameters", RequestType.POST, self._handle_set_parameters
-        )
-        self.server.register_endpoint(
-            "/printer/subscribe_parameters", RequestType.POST, self._handle_subscribe_parameters
-        )
-        self.server.register_endpoint(
-            "/printer/unsubscribe_parameters", RequestType.POST, self._handle_unsubscribe_parameters
-        )
-        
-        self.server.register_endpoint(
-            "/machine/logs/download", RequestType.GET, self._handle_log_download
-        )
-
         self.server.register_notification("machine:service_state_changed")
         self.server.register_notification("machine:sudo_alert")
 
@@ -211,11 +190,99 @@ class Machine:
         self.init_evt = asyncio.Event()
         self.libcam = self._try_import_libcamera()
 
+    @staticmethod
+    def _get_cpu_sn():
+        sn = None
+        try:
+            with open('/proc/cpuinfo', 'r') as f:
+                for line in f:
+                    if line.startswith('Serial'):
+                        sn = line.split(':')[1].strip()
+        except FileNotFoundError:
+            logging.error("/proc/cpuinfo not found. Are you on a Linux system and ARM architecture?")
+        except Exception as e:
+            logging.error(f"Error reading /proc/cpuinfo: {e}")
+        logging.debug(f'cpu sn: {sn}')
+        return sn
+
+    @staticmethod
+    def _to_base62(num: int) -> str:
+        BASE62_ALPHABET = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+        if num == 0:
+            return "0"
+        result = []
+        base = len(BASE62_ALPHABET)
+        while num > 0:
+            num, r = divmod(num, base)
+            result.append(BASE62_ALPHABET[r])
+        result.reverse()
+        return ''.join(result)
+
+    def _gen_machine_id(self):
+        cpu_sn = Machine._get_cpu_sn()
+
+        if cpu_sn is not None and len(cpu_sn) == 16:
+            # 16进制字符串转十进制整数
+            cpu_sn_int = int(cpu_sn, 16)
+            # 转62进制
+            machine_id = Machine._to_base62(cpu_sn_int)
+        else:
+            # 其他情况，使用UUID生成12位62进制ID
+            cpu_sn = str(uuid.uuid4())
+            logging.warning(f"Cannot get CPU serial number, using random UUID: {cpu_sn}")
+            sha256 = hashlib.sha256(cpu_sn.encode("utf-8")).digest()
+            hash_num = int.from_bytes(sha256[:12], byteorder="big", signed=False)  # 取12字节适配12位62进制
+            machine_id = Machine._to_base62(hash_num)
+
+        # 统一处理：固定12位长度（不足补0，超长取后12位）
+        if len(machine_id) > 12:
+            machine_id = machine_id[-12:]  # 超长取后12位
+        else:
+            machine_id = machine_id.rjust(12, "0")  # 不足补0
+
+        # 拼接两个字符的机器型号在machine_id的开头
+        machine_type = self.config.get("printer_type_code", "00")
+        machine_id = machine_type + machine_id
+
+        logging.info(f"Generated machine ID: {machine_id}")
+        return machine_id
+
+    def get_machine_id(self) -> str:
+        return self._parameters["machine_id"]
+
+    def get_machine_name(self) -> str:
+        """Get the current machine name"""
+        return self._parameters.get("machine_name", "fibre seek printer")
+
+    async def set_machine_name(self, new_value: str) -> None:
+        """Set the machine name and persist it to database"""
+        # Validate input
+        if not new_value or not isinstance(new_value, str):
+            raise self.server.error("Machine name must be a non-empty string", 400)
+        if len(new_value) > 100:
+            raise self.server.error("Machine name must be less than 100 characters", 400)
+        
+        # Update the value
+        old_value = self._parameters.get("machine_name")
+        if old_value == new_value:
+            return  # No change needed
+        
+        # Persist to database
+        try:
+            await self.database.update_item("fibretouch", "machine_name", new_value)
+            # Update in memory
+            self._parameters["machine_name"] = new_value
+            # Notify other components of the change
+            self.server.send_event("machine:machine_name_changed", new_value)
+        except Exception as e:
+            logging.exception(f"Failed to set machine name: {e}")
+            raise self.server.error(f"Failed to set machine name: {str(e)}", 500)
+
     async def _load_parameters(self) -> None:
         """Load parameters from database"""
         try:
             # Load machine_name from database, default to "fibre seek printer"
-            machine_name = await self.database.get_item("moonraker", "machine_name")
+            machine_name = await self.database.get_item("fibretouch", "machine_name")
             logging.info(f"machine_name in batabase: {machine_name}")
             self._parameters["machine_name"] = machine_name
             # Notify other components of the change
@@ -223,7 +290,18 @@ class Machine:
         except Exception as e:
             logging.info(f"Failed to load parameters: {e}")
             # Set default value if database loading fails
-            await self.database.insert_item("moonraker", "machine_name", self._parameters["machine_name"])
+            await self.database.insert_item("fibretouch", "machine_name", self._parameters["machine_name"])
+
+        try:
+            machine_id = await self.database.get_item("fibretouch", "machine_id")
+            logging.info(f"machine_id in batabase: {machine_id}")
+            self._parameters["machine_id"] = machine_id
+            # Notify other components of the change
+            self.server.send_event("machine:machine_id_changed", self._parameters["machine_id"])
+        except Exception as e:
+            logging.info(f"Failed to load parameters: {e}")
+            # Set default value if database loading fails
+            await self.database.insert_item("fibretouch", "machine_id", self._parameters["machine_id"])
 
     def _init_allowed_services(self) -> None:
         app_args = self.server.get_app_args()
@@ -494,204 +572,9 @@ class Machine:
     async def _handle_video_request(self, web_request: WebRequest) -> Dict[str, Any]:
         return await self.detect_video_devices()
 
-    async def _handle_get_parameters(self, web_request: WebRequest) -> Dict[str, Any]:
-        """Handle printer.get_parameters request"""
-        params = web_request.get_args()
-        requested_params = params.keys()
-        result = {}
-        
-        for param_name in requested_params:
-            if param_name == "machine_name":
-                result[param_name] = self.get_machine_name()
-            else:
-                # Handle other parameters in the future
-                result[param_name] = None
-        
-        return result
-
-    async def _handle_set_parameters(self, web_request: WebRequest) -> Dict[str, Any]:
-        """Handle printer.set_parameters request"""
-        params = web_request.get_args()
-        results = {}
-        all_successful = True
-        
-        for param_name, value in params.items():
-            try:
-                if param_name == "machine_name":
-                    await self.set_machine_name(value)
-                    results[param_name] = {"success": True, "message": "Parameter updated successfully"}
-                else:
-                    # Handle other parameters in the future
-                    results[param_name] = {"success": False, "message": "Parameter not supported"}
-                    all_successful = False
-            except Exception as e:
-                results[param_name] = {"success": False, "message": str(e)}
-                all_successful = False
-        results["all_success"] = all_successful
-        return results
-
-    async def _handle_subscribe_parameters(self, web_request: WebRequest) -> Dict[str, Any]:
-        """Handle printer.subscribe_parameters request"""
-        params = web_request.get_args()
-        conn = web_request.get_subscribable()
-        
-        if conn is None:
-            raise self.server.error("Subscription requires a persistent connection", 400)
-        
-        for param_name in params.keys():
-            if param_name == "machine_name":
-                self.subscribe_parameter(param_name, conn)
-            else:
-                # Handle other parameters in the future
-                pass
-        
-        # Return current values of subscribed parameters
-        current_values = {}
-        for param_name in params.keys():
-            if param_name == "machine_name":
-                current_values[param_name] = self.get_machine_name()
-        
-        return current_values
-
-    async def _handle_unsubscribe_parameters(self, web_request: WebRequest) -> Dict[str, Any]:
-        """Handle printer.unsubscribe_parameters request"""
-        params = web_request.get_args()
-        conn = web_request.get_subscribable()
-        
-        if conn is None:
-            raise self.server.error("Unsubscription requires a persistent connection", 400)
-        
-        for param_name in params.keys():
-            if param_name == "machine_name":
-                self.unsubscribe_parameter(param_name, conn)
-            else:
-                # Handle other parameters in the future
-                pass
-        
-        return {"result": "ok"}
-    
-    async def _handle_log_download(self, web_request: WebRequest) -> Dict[str, Any]:
-        """Handle machine.logs.download request"""
-        import zipfile
-        import tempfile
-        import time
-        
-        # Define the logs directory path
-        logs_dir = "/home/anisoprint/printer_data/logs"
-        
-        # Check if the logs directory exists
-        if not os.path.exists(logs_dir) or not os.path.isdir(logs_dir):
-            raise self.server.error(f"Logs directory not found: {logs_dir}")
-        
-        # Create a temporary zip file
-        suffix = time.strftime("%Y%m%d-%H%M%S", time.localtime())
-        zip_filename = f"logs-{suffix}.zip"
-        
-        temp_dir = tempfile.gettempdir()
-        zip_path = os.path.join(temp_dir, zip_filename)
-        
-        try:
-            # Create zip file and add all files from the logs directory
-            with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
-                for root, _, files in os.walk(logs_dir):
-                    for file in files:
-                        file_path = os.path.join(root, file)
-                        # Calculate relative path for the zip archive
-                        rel_path = os.path.relpath(file_path, logs_dir)
-                        zf.write(file_path, rel_path)
-            
-            # Get file size
-            file_size = os.path.getsize(zip_path)
-            
-            # Register a temporary static file handler for the zip file
-            app = self.server.lookup_component("application")
-            temp_log_path = f"temp_logs/{zip_filename}"
-            app.register_static_file_handler(temp_log_path, zip_path, force=True)
-            
-            # Return the zip file as a downloadable resource
-            return {
-                "filename": zip_filename,
-                "size": file_size,
-                "url": f"/server/files/{temp_log_path}"
-            }
-        except Exception as e:
-            logging.exception(f"Error creating log archive: {e}")
-            raise self.server.error(f"Failed to create log archive: {str(e)}")
-
     def get_system_info(self) -> Dict[str, Any]:
         return self.system_info
 
-    def get_machine_name(self) -> str:
-        """Get the current machine name"""
-        return self._parameters.get("machine_name", "fibre seek printer")
-
-    async def set_machine_name(self, new_value: str) -> None:
-        """Set the machine name and persist it to database"""
-        # Validate input
-        if not new_value or not isinstance(new_value, str):
-            raise self.server.error("Machine name must be a non-empty string", 400)
-        if len(new_value) > 100:
-            raise self.server.error("Machine name must be less than 100 characters", 400)
-        
-        async with self._param_lock:
-            # Update the value
-            old_value = self._parameters.get("machine_name")
-            if old_value == new_value:
-                return  # No change needed
-            
-            # Persist to database
-            try:
-                await self.database.update_item("moonraker", "machine_name", new_value)
-                # Update in memory
-                self._parameters["machine_name"] = new_value
-                # Notify other components of the change
-                self.server.send_event("machine:machine_name_changed", new_value)
-                # Send notification to subscribers
-                await self._notify_parameter_changed("machine_name", new_value)
-            except Exception as e:
-                logging.exception(f"Failed to set machine name: {e}")
-                raise self.server.error(f"Failed to set machine name: {str(e)}", 500)
-
-    async def _notify_parameter_changed(self, param_name: str, new_value: Any) -> None:
-        """Notify subscribers of parameter changes"""
-        subscribers = self._parameter_subscriptions.get(param_name, set())
-        if not subscribers:
-            return
-        
-        # Create notification message
-        notification = {
-            "jsonrpc": "2.0",
-            "method": "notify_printer_parameters_changed",
-            "params": {param_name: new_value}
-        }
-        
-        # Send notification to all subscribers
-        for conn in subscribers:
-            try:
-                await conn.send_json(notification)
-            except Exception as e:
-                logging.exception(f"Failed to send parameter notification: {e}")
-                # Remove invalid connection
-                self._parameter_subscriptions[param_name].discard(conn)
-
-    def subscribe_parameter(self, param_name: str, connection: Any) -> None:
-        """Subscribe to parameter changes"""
-        if param_name not in self._parameter_subscriptions:
-            self._parameter_subscriptions[param_name] = set()
-        self._parameter_subscriptions[param_name].add(connection)
-
-    def unsubscribe_parameter(self, param_name: str, connection: Any) -> None:
-        """Unsubscribe from parameter changes"""
-        if param_name in self._parameter_subscriptions:
-            self._parameter_subscriptions[param_name].discard(connection)
-
-    def remove_subscriber(self, connection: Any) -> None:
-        """Remove a connection from all subscriptions"""
-        for param_name, subscribers in list(self._parameter_subscriptions.items()):
-            if connection in subscribers:
-                subscribers.remove(connection)
-            if not subscribers:
-                del self._parameter_subscriptions[param_name]
 
     @property
     def sudo_password(self) -> Optional[str]:
@@ -808,25 +691,6 @@ class Machine:
         except Exception:
             logging.info("Error Reading SDCard CSD Register")
         return sd_info
-
-    async def _on_klippy_ready(self) -> None:
-        """Called when Klipper is ready, fetches machine id from Klipper"""
-        logging.info("Klipper is ready, fetching machine id")
-        try:
-            # Get Klippy API component
-            klippy_apis = self.server.lookup_component("klippy_apis")
-            # Call info endpoint to get machine id
-            info = await klippy_apis.get_klippy_info()
-            if isinstance(info, dict) and "machine_id" in info:
-                self.machine_id = info["machine_id"]
-                logging.info(f"Retrieved machine id from Klipper: {self.machine_id}")
-                # Notify other components
-                self.server.send_event("machine:machine_id_available", self.machine_id)
-            else:
-                logging.warning("Machine id not found in Klipper info")
-                logging.info(f"Klippy info: {info}")
-        except Exception as e:
-            logging.warning(f"Failed to get machine id from Klipper: {e}")
 
     def _get_cpu_info(self) -> Dict[str, Any]:
         cpu_file = pathlib.Path("/proc/cpuinfo")

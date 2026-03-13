@@ -222,25 +222,16 @@ class SSDPServer(asyncio.protocols.DatagramProtocol):
         logging.info(f"machine: {self.machine}")
         self.machine_name = self.machine.get_machine_name()
         logging.info(f"machine_name: {self.machine_name}")
-        self.machine_id: str = ""
+        self.machine_id: str = self.machine.get_machine_id()
+        logging.info(f"machine_id: {self.machine_id}")
 
-        # Register event handler for machine id available
-        self.server.register_event_handler(
-            "machine:machine_id_available", self._on_machine_id_available
-        )
         # Register event handler for machine name changed
         self.server.register_event_handler(
             "machine:machine_name_changed", self._on_machine_name_changed
         )
-
-    def _on_machine_id_available(self, machine_id: str) -> None:
-        """Called when machine id is available, updates response headers"""
-        logging.info(f"Machine id available: {machine_id}")
-        self.machine_id = machine_id
-        for header in self.response_headers:
-            if header.startswith("X-MACHINE-ID"):
-                self.response_headers.remove(header)
-        self.response_headers.append(f"X-MACHINE-ID: {self.machine_id}")
+        self.server.register_event_handler(
+            "machine:machine_id_changed", self._on_machine_id_changed
+        )
 
     def _on_machine_name_changed(self, machine_name: str) -> None:
         """Called when machine name is changed, updates response headers"""
@@ -258,6 +249,16 @@ class SSDPServer(asyncio.protocols.DatagramProtocol):
         #     if self.running:
         #         cur_ad = next(self.advertisements)
         #         self.transport.sendto(cur_ad, SSDP_ADDR)
+
+    def _on_machine_id_changed(self, machine_id: str) -> None:
+        """Called when machine ID is changed, updates response headers"""
+        logging.info(f"Machine ID changed: {machine_id}")
+        self.machine_id = machine_id
+        # Update response headers
+        for header in self.response_headers:
+            if header.startswith("X-MACHINE-ID"):
+                self.response_headers.remove(header)
+        self.response_headers.append(f"X-MACHINE-ID: {self.machine_id}")    
 
     def _create_ssdp_socket(
         self,
@@ -333,6 +334,7 @@ class SSDPServer(asyncio.protocols.DatagramProtocol):
             "EXT:",
             f"SERVER: {SSDP_SERVER_ID}",
             f"X-SPECIAL-MARKER: FIBRESEEK3D",
+            f"X-MACHINE-ID: {self.machine_id}",
             f"X-MACHINE-NAME: {self.machine_name}",
             f"CACHE-CONTROL: max-age={SSDP_MAX_AGE}",
             f"BOOTID.UPNP.ORG: {self.boot_id}",
