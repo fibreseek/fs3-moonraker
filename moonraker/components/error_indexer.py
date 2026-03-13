@@ -153,19 +153,31 @@ class ErrorIndexer:
         group_for_ph: Dict[str, int] = {}
         next_group = 1
         result_parts: List[str] = []
-        for part in parts:
+        total_parts = len(parts)
+        for idx, part in enumerate(parts):
             if PLACEHOLDER_RE.fullmatch(part):
                 ph = part
                 if ph in group_for_ph:
+                    # 重复占位符使用反向引用，确保多次出现时值一致
                     result_parts.append("\\" + str(group_for_ph[ph]))
                 else:
                     group_for_ph[ph] = next_group
-                    result_parts.append("(.*?)")
+                    # 针对「%N:%M」这类范围模式，限制前一个占位符不跨越冒号，
+                    # 避免将整个区间都匹配到第一个占位符，导致第二个占位符为空
+                    next_literal = parts[idx + 1] if idx + 1 < total_parts else ""
+                    if next_literal and not PLACEHOLDER_RE.fullmatch(next_literal) \
+                            and next_literal.startswith(":"):
+                        # 形如 \"%3:%4\"，则 %3 仅匹配到冒号前的内容
+                        result_parts.append("([^:]*)")
+                    else:
+                        result_parts.append("(.*?)")
                     next_group += 1
             else:
                 result_parts.append(re.escape(part))
         try:
-            return re.compile("".join(result_parts), re.IGNORECASE)
+            # 使用全行匹配，避免只匹配到前半段导致尾部占位符为空
+            pattern = "^" + "".join(result_parts) + "$"
+            return re.compile(pattern, re.IGNORECASE)
         except re.error:
             logging.warning("Error Indexer: Invalid regex from template: %s", template[:80])
             return None
