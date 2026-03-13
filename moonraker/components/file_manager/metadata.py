@@ -1285,6 +1285,15 @@ class AuraSlicer(BaseSlicer):
     def parse_first_layer_bed_temp(self) -> Optional[float]:
         return regex_find_float(r"M190 S(%F)", self.header_data)
     
+    def parse_chamber_temp(self) -> Optional[float]:
+        # 优先检测M141，只解析S参数，忽略可能的P参数；如果没有则检测M191，同理
+        # 匹配M141 Sxx或M141 Sxx Pxx（只取S）
+        temp = regex_find_float(r"M141 S(%F)(?: P\d+)?", self.header_data)
+        if temp is not None:
+            return temp
+        # 匹配M191 Sxx或M191 Sxx Pxx（只取S）
+        return regex_find_float(r"M191 S(%F)(?: P\d+)?", self.header_data)
+    
 READ_SIZE = 1024 * 1024  # 1 MiB
 SUPPORTED_SLICERS: List[Type[BaseSlicer]] = [
     PrusaSlicer, Slic3rPE, Slic3r, Cura, Simplify3D,

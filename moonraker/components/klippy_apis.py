@@ -97,6 +97,8 @@ class KlippyAPI(APITransport):
         auto_leveling: bool = web_request.get_boolean('auto_leveling', False)
         timelapse: bool = web_request.get_boolean('timelapse', False)
         skip_foreign_detect: bool = web_request.get_boolean('skip_foreign_detect', False)
+        # 是否跳过整个预检查流程（包括 AI、传感器等），主要用于用户确认后“忽略并继续”
+        skip_precheck: bool = web_request.get_boolean('skip_precheck', False)
 
         gcodes_dir = os.path.expanduser("~/printer_data/gcodes/")
         file_manager = self.server.lookup_component("file_manager")
@@ -131,7 +133,8 @@ class KlippyAPI(APITransport):
             user=user,
             auto_leveling=auto_leveling,
             timelapse=timelapse,
-            skip_foreign_detect=skip_foreign_detect
+            skip_foreign_detect=skip_foreign_detect,
+            skip_precheck=skip_precheck,
         )
 
     async def _gcode_restart(self, web_request: WebRequest) -> str:
@@ -172,7 +175,8 @@ class KlippyAPI(APITransport):
         user: Optional[UserInfo] = None,
         auto_leveling: bool = False,
         timelapse: bool = False,
-        skip_foreign_detect: bool = False
+        skip_foreign_detect: bool = False,
+        skip_precheck: bool = False,
     ) -> str:
         # WARNING: Do not call this method from within the following
         # event handlers when "wait_klippy_started" is set to True:
@@ -206,16 +210,17 @@ class KlippyAPI(APITransport):
                 logging.warning("Unable to predict job_id, no history records found")
         except Exception as e:
             logging.warning(f"Failed to predict job_id: {e}")
-        
-        
+
+        print_mode: int = -1
         if metadata:
             logging.info(f"Processing print parameters from metadata for file: {filename}")
             
             # 从元数据中提取打印参数
-            print_mode = self._parse_print_mode(metadata.get("print_mode", ""))
+            print_mode = self._parse_print_mode(metadata.get("print_mode", -1))
             left_temp = metadata.get("first_layer_extr_temp", 0)
             right_temp = metadata.get("first_layer_extr_temp1", 0)
             bed_temp = metadata.get("first_layer_bed_temp", 0)
+            chamber_temp = metadata.get("chamber_temp", 0.0) or 0.0
             
             bounding_box = metadata.get("bounding_box_size", {})
             x_min = bounding_box.get("x_min", 0.0)
@@ -231,6 +236,7 @@ class KlippyAPI(APITransport):
                 f"SAVE_VARIABLE VARIABLE=printing_info_left_preheat_temperature VALUE={left_temp}",
                 f"SAVE_VARIABLE VARIABLE=printing_info_right_preheat_temperature VALUE={right_temp}",
                 f"SAVE_VARIABLE VARIABLE=printing_info_bed_preheat_temperature VALUE={bed_temp}",
+                f"SAVE_VARIABLE VARIABLE=printing_info_chamber_temperature VALUE={chamber_temp}",
                 f"SAVE_VARIABLE VARIABLE=printing_info_auto_leveling VALUE={1 if auto_leveling else 0}",
                 f"SAVE_VARIABLE VARIABLE=printing_info_mode_x_max VALUE={x_max}",
                 f"SAVE_VARIABLE VARIABLE=printing_info_mode_x_min VALUE={x_min}",
@@ -254,59 +260,13 @@ class KlippyAPI(APITransport):
             except Exception as e:
                 logging.warning(f"Failed to save filename with path: {e}")
 
-        # 打印前异物检测
-        if not skip_foreign_detect:
-            try:
-                # 检查组件是否加载失败
-                if "ai_detection" in self.server.failed_components:
-                    raise self.server.error(
-                        "AI Detection component failed to load, foreign object detection unavailable",
-                        503
-                    )
-                ai_detection = self.server.lookup_component("ai_detection")
-                # 检查总开关，未启用则跳过检测
-                if not ai_detection.is_enabled():
-                    logging.info("AI Detection is disabled, skipping foreign object detection")
-                else:
-                    # 检查连接状态
-                    if not ai_detection.is_connected:
-                        raise self.server.error(
-                            "AI Detection service is not connected",
-                            503
-                        )
-                    # 检查总开关和异物检测开关
-                    if ai_detection.is_foreign_detect_enabled():
-                        result = await ai_detection.detect_foreign_object(
-                            send_notification=True  # 发送通知
-                        )
-
-                        if result.is_valid and result.has_object:
-                            # 检测有效且有异物，抛出错误阻止打印启动
-                            class_names = result.class_names if result.class_names else []
-                            objects_str = ", ".join(class_names) if class_names else "unknown objects"
-                            logging.warning(
-                                f"AI Detection: Foreign object detected: {objects_str}, blocking print start"
-                            )
-                            raise self.server.error(
-                                "Foreign object detected, please confirm before printing",
-                                403
-                            )
-                        elif result.is_valid and not result.has_object:
-                            # 检测有效且无异物，继续打印
-                            logging.info("AI Detection: No foreign objects detected, proceeding with print")
-                        else:
-                            # 检测无效（可能未连接），记录警告但继续打印
-                            logging.warning(
-                                "AI Detection: Foreign object detection not available, "
-                                "proceeding with print anyway"
-                            )
-                    else:
-                        logging.info("AI Detection: Foreign object detection disabled, skipping...")
-            except self.server.error:
-                raise  # 重新抛出 server.error
-            except Exception as e:
-                # 异常记录警告但继续打印（容错处理）
-                logging.warning(f"AI Detection: Foreign object check failed: {e}, proceeding with print")
+        # 打印前预检查（AI / 传感器等）
+        if not skip_precheck:
+            await self._run_precheck(
+                skip_foreign_detect=skip_foreign_detect,
+                print_mode=print_mode,
+                chamber_temp=chamber_temp,
+            )
 
         # Escape existing double quotes in the file name
         filename_only = filename_only.replace("\"", "\\\"")
@@ -319,6 +279,245 @@ class KlippyAPI(APITransport):
         self.server.send_event("klippy_apis:job_start_complete", user)
         return ret
 
+    async def _run_precheck(
+        self,
+        skip_foreign_detect: bool = False,
+        print_mode: int = -1,
+        chamber_temp: float = 0.0,
+    ) -> None:
+        """
+        打印前预检查流程入口。
+        当前实现：
+          - AI 平台异物检测（可通过 skip_foreign_detect 跳过）
+          - 打印底板安放检测（AI）
+          - 耗材存在检测（传感器，基于 print_mode 检查对应耗材传感器）
+        预留扩展：
+          - 加热腔门/顶盖关闭检测
+
+        前端接口（供上位机如 anisotouch-sk3 后续接入）：
+        - WebSocket 订阅: 方法名 notify_precheck_status，payload 形如:
+          {"step": "overall"|"bed_foreign_object"|"build_plate"|"filament"|"enclosure",
+           "status": "started"|"running"|"ok"|"failed"|"skipped"|"unavailable",
+           "message": "<可选>", "data": "<可选>"}
+        - Klipper 状态: objects/query 或 notify_status_update 中 print_stats.state
+          可为 "precheck"，表示处于预检查阶段；预检查通过并下发 SDCARD_PRINT_FILE 后
+          会变为 "printing"。
+        - 忽略并继续: POST /printer/print/start 传 skip_foreign_detect=true 或
+          skip_precheck=true 可跳过对应检查后继续打印。
+        """
+        try:
+            await self.run_gcode("SET_PRINT_PRECHECK_STATE")
+        except Exception as e:
+            # 该指令失败不应阻断打印，仅记录日志
+            logging.warning(f"Precheck: failed to set print state to precheck: {e}")
+
+        try:
+            # 1. 平台异物检测 + 打印底板检测（AI）
+            if skip_foreign_detect:
+                logging.info("Precheck: skipping foreign object detection due to skip_foreign_detect flag")
+            else:
+                try:
+                    # 检查组件是否加载失败
+                    if "ai_detection" in self.server.failed_components:
+                        msg = (
+                            "AI Detection component failed to load, "
+                            "foreign object detection unavailable"
+                        )
+                        self.server.send_event(
+                            "precheck:failed",
+                            {"message": msg, "step": "ai_detection", "http_code": 503},
+                        )
+                        raise self.server.error(msg, 503)
+                    ai_detection = self.server.lookup_component("ai_detection")
+                    # 检查总开关，未启用则跳过检测
+                    if not ai_detection.is_enabled():
+                        logging.info("AI Detection is disabled, skipping foreign object detection")
+                    else:
+                        # 检查连接状态
+                        if not ai_detection.is_connected:
+                            msg = "AI Detection service is not connected"
+                            self.server.send_event(
+                                "precheck:failed",
+                                {"message": msg, "step": "ai_detection", "http_code": 503},
+                            )
+                            raise self.server.error(msg, 503)
+                        # 检查总开关和异物检测开关
+                        if ai_detection.is_foreign_detect_enabled():
+                            # 调用 AI 异物检测，由 ai_detection 模块统一解析:
+                            # - result.has_object: 是否检测到平台异物
+                            # - result.no_build_plate: 是否未检测到打印底板
+                            result = await ai_detection.detect_foreign_object(send_notification=False)
+
+                            # 1.1 平台异物检查结果
+                            if result.is_valid:
+                                if getattr(result, "has_object", False):
+                                    if getattr(result, "no_build_plate", False):
+                                        msg = (
+                                            "AI Detection: Build plate not detected, "
+                                            "please install build plate before printing"
+                                        )
+                                        logging.warning(msg)
+                                        self.server.send_event(
+                                            "precheck:failed",
+                                            {
+                                                "message": msg,
+                                                "step": "build_plate",
+                                                "http_code": 403,
+                                                "data": {"has_no_plate": True},
+                                            },
+                                        )
+                                        raise self.server.error("build_plate", 403)
+                                    else:
+                                        msg = (
+                                            "AI Detection: Foreign object detected, "
+                                            "blocking print start"
+                                        )
+                                        logging.warning(msg)
+                                        self.server.send_event(
+                                            "precheck:failed",
+                                            {
+                                                "message": msg,
+                                                "step": "foreign_object",
+                                                "http_code": 403,
+                                                "data": {"has_object": True},
+                                            },
+                                        )
+                                        raise self.server.error("foreign_object", 403)
+                                else:
+                                    logging.info("AI Detection: No foreign objects detected")
+                            else:
+                                # 检测无效（可能未连接），记录警告但继续打印
+                                msg = (
+                                    "AI Detection: Foreign object detection not available, "
+                                    "proceeding with print anyway"
+                                )
+                                logging.warning(msg)
+                        else:
+                            logging.info("AI Detection: Foreign object detection disabled, skipping...")
+                except self.server.error:
+                    raise
+                except Exception as e:
+                    # 异常记录警告但继续打印（容错处理）
+                    logging.warning(f"AI Detection: Foreign object check failed: {e}, proceeding with print")
+            # 2. 耗材存在检测（传感器）
+            if print_mode < 0:
+                # 无有效 print_mode（例如元数据缺失），直接跳过耗材检查
+                logging.info("Filament precheck: invalid or missing print_mode, skipping filament presence check")
+            else:
+                try:
+                    # 根据 print_mode 选择需要检查的传感器
+                    filament_sensors: List[str] = []
+                    print_mode_text = ""
+                    if print_mode == 0:  # Plastic Only
+                        print_mode_text = "High Speed Mode"
+                        filament_sensors = [
+                            "filament_switch_sensor filament_sensor_3",
+                        ]
+                    elif print_mode == 1: # Plastic and Composite
+                        print_mode_text = "High Strength Mode"
+                        filament_sensors = [
+                            "filament_switch_sensor filament_sensor",
+                            "filament_switch_sensor filament_sensor_1",
+                            "filament_switch_sensor filament_sensor_3",
+                        ]
+                    elif print_mode == 2: # Composite Only
+                        print_mode_text = "Hyper Strength Mode"
+                        filament_sensors = [
+                            "filament_switch_sensor filament_sensor",
+                            "filament_switch_sensor filament_sensor_1", 
+                        ]
+
+                    if not filament_sensors:
+                        logging.info(f"Filament precheck: no sensors configured for print_mode={print_mode}, skipping filament presence check")
+                    else:
+                        # 查询传感器状态
+                        query_objects: Dict[str, Optional[List[str]]] = {
+                            name: None for name in filament_sensors
+                        }
+                        try:
+                            status = await self.query_objects(query_objects)
+                        except Exception as e:
+                            logging.warning(f"Filament precheck: failed to query filament sensors: {e}, proceeding with print anyway")
+                        else:
+                            missing: List[str] = []
+                            for name in filament_sensors:
+                                obj = status.get(name, {})
+                                filament_present = bool(obj.get("filament_detected", True))
+                                enabled = bool(obj.get("enabled", True))
+                                # 仅在传感器启用且检测到无料时视为缺料
+                                if enabled and not filament_present:
+                                    missing.append(name)
+
+                            if missing:
+                                msg = (f"Print Mode:{print_mode_text}, detected missing filament.")
+                                logging.warning("%s. Missing sensors: %s", msg, ", ".join(missing))
+                                self.server.send_event(
+                                    "precheck:failed",
+                                    {
+                                        "message": msg,
+                                        "step": "filament",
+                                        "http_code": 403,
+                                        "data": {
+                                            "print_mode": print_mode,
+                                            "missing_sensors": missing,
+                                        },
+                                    },
+                                )
+                                raise self.server.error("filament", 403)
+                            else:
+                                logging.info("Filament precheck: all required sensors report filament present")
+                except self.server.error:
+                    raise
+                except Exception as e:
+                    logging.warning(f"Filament precheck: failed: {e}, proceeding with print anyway")
+
+            # 4. 加热腔门/顶盖检测
+            try:
+                if not chamber_temp or chamber_temp <= 0.0:
+                    logging.info("Enclosure precheck: no chamber temperature configured, skipping door/top cover check")
+                else:
+                    # 查询门传感器状态
+                    try:
+                        status = await self.query_objects(
+                            {"filament_switch_sensor door_hall_sensor": None}
+                        )
+                    except Exception as e:
+                        logging.warning(f"Enclosure precheck: failed to query door_hall_sensor: {e}, proceeding with print anyway")
+                    else:
+                        obj = status.get("filament_switch_sensor door_hall_sensor", {})
+                        door_closed = bool(obj.get("filament_detected", True))
+                        enabled = bool(obj.get("enabled", True))
+
+                        if enabled and not door_closed:
+                            msg = "The current printing task requires maintaining the cavity temperature, and it is detected that the door is not closed."
+                            logging.warning(msg)
+                            self.server.send_event(
+                                "precheck:failed",
+                                {
+                                    "message": msg,
+                                    "step": "enclosure_door",
+                                    "http_code": 403,
+                                    "data": {
+                                        "sensor": "filament_switch_sensor door_hall_sensor",
+                                        "chamber_temp": chamber_temp,
+                                    },
+                                },
+                            )
+                            raise self.server.error("enclosure_door", 403)
+                        else:
+                            logging.info("Enclosure precheck: door and top cover are closed, proceeding with print")
+            except self.server.error:
+                logging.warning("Precheck failed on enclosure check")
+                raise
+            except Exception as e:
+                logging.warning(f"Enclosure precheck: check failed: {e}, proceeding with print")
+        except self.server.error:
+            # 预检查失败时，将 print_stats.state 恢复为 standby，避免长时间停留在 precheck/error 状态
+            try:
+                await self.run_gcode("SET_PRINT_STATS_INFO STATE=standby")
+            except Exception as e:
+                logging.warning(f"Precheck: failed to reset print_stats.state to standby: {e}")
+            raise
 
     async def _get_max_job_id(self, history) -> Optional[int]:
         """

@@ -289,13 +289,14 @@ class ForeignDetectionResult:
 
     异物类别由配置文件定义，默认:
         0/1 - 底板上的异物
-        2 - 检测到手
+        2   - 未检测到打印底板（或相关场景）
     """
     is_valid: bool
     has_object: bool = False  # 是否有异物
     scores: List[float] = field(default_factory=list)  # 置信度
     boxes: List[List[float]] = field(default_factory=list)  # 异物目标框
     classes: List[int] = field(default_factory=list)  # 异物所属类别
+    no_build_plate: bool = False  # 是否未检测到打印底板
 
     @property
     def class_names(self) -> List[str]:
@@ -305,12 +306,16 @@ class ForeignDetectionResult:
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "ForeignDetectionResult":
+        classes: List[int] = data.get("classes", []) or []
+        # 约定: 类别 ID 为 2 表示未检测到打印底板
+        no_build_plate = 2 in classes
         return cls(
             is_valid=data.get("is_valid", False),
             has_object=data.get("has_object", False),
             scores=data.get("scores", []),
             boxes=data.get("boxes", []),
-            classes=data.get("classes", [])
+            classes=classes,
+            no_build_plate=no_build_plate,
         )
 
     def to_dict(self) -> Dict[str, Any]:
@@ -321,7 +326,8 @@ class ForeignDetectionResult:
             "scores": self.scores,
             "boxes": self.boxes,
             "classes": self.classes,
-            "class_names": [registry.get_foreign_name(c) for c in self.classes]
+            "class_names": [registry.get_foreign_name(c) for c in self.classes],
+            "no_build_plate": self.no_build_plate,
         }
 
 
@@ -867,9 +873,9 @@ class AIDetectionClient:
 
         if result.has_object:
             logging.warning(
-                f"AI 检测: 检测到异物 - "
-                f"类别: {result.classes}, 位置: {result.boxes}, "
-                f"置信度: {result.scores}"
+                f"AI Detection: Foreign object detected - "
+                f"Class: {result.classes}, Box: {result.boxes}, "
+                f"Score: {result.scores}"
             )
 
         # 根据场景决定是否发送通知

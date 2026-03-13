@@ -34,7 +34,7 @@ class ErrorIndexer:
         # 加载错误数据库
         self._load_error_db()
         logging.info(
-            "Error Indexer: 组件已加载 (module=%s, file_path=%s, language=%s, db_size=%d)",
+            "Error Indexer: Component loaded (module=%s, file_path=%s, language=%s, db_size=%d)",
             __file__, self.file_path, self.language, len(self.error_db)
         )
         # 注册事件处理程序
@@ -47,7 +47,7 @@ class ErrorIndexer:
         self._hook_gcode_api()
 
     def _get_file_path(self, config: ConfigHelper) -> str:
-        """xlsx 路径：优先 xlsx_path，其次 file_path、csv_path，最后默认 error_info.xlsx。"""
+        """xlsx path: prioritize xlsx_path, then file_path, csv_path, finally default error_info.xlsx."""
         default_path = os.path.abspath(
             os.path.join(os.path.dirname(__file__), "../../error_info.xlsx")
         )
@@ -65,6 +65,10 @@ class ErrorIndexer:
         # 2) 捕获 Klipper 输出的 G-code 响应（含 "!!" 标准错误）
         self.server.register_event_handler(
             "server:gcode_response", self._handle_gcode_response
+        )
+        # 3) 捕获预检查失败（klippy_apis 在 _run_precheck 中发出）
+        self.server.register_event_handler(
+            "precheck:failed", self._handle_precheck_failed
         )
 
     # 注册 REST API 端点
@@ -91,13 +95,13 @@ class ErrorIndexer:
             )
         except Exception as e:
             logging.warning(
-                "Error Indexer: 恢复语言设置失败，将使用当前配置的语言 (%s)，错误: %s",
+                "Error Indexer: Failed to restore language setting, using current configured language (%s): %s",
                 self.language, e
             )
             return
         if isinstance(stored_lang, str) and stored_lang:
             self.language = stored_lang
-            logging.info("Error Indexer: 从数据库恢复语言设置为 %s", self.language)
+            logging.info("Error Indexer: Restored language setting from database: %s", self.language)
 
     # 持久化语言设置
     async def _persist_language(self) -> None:
@@ -105,12 +109,12 @@ class ErrorIndexer:
             await self.database.insert_item(DB_NAMESPACE, DB_LANGUAGE_KEY, self.language)
         except Exception as e:
             logging.warning(
-                "Error Indexer: 持久化语言设置失败 (%s): %s",
+                "Error Indexer: Failed to persist language setting (%s): %s",
                 self.language, e
             )
 
     def _hook_gcode_api(self) -> None:
-        """挂钩 printer.gcode.script API 以捕获错误响应。"""
+        """Hook printer.gcode.script API to capture error responses."""
         method_info = self.jsonrpc.get_method("printer.gcode.script")
         if not method_info:
             return
@@ -123,21 +127,21 @@ class ErrorIndexer:
                 self._handle_gcode_response(f"!! {str(e)}")
                 raise
         api_def.callback = wrapped_callback
-        logging.info("Error Indexer: 已挂钩 printer.gcode.script API")
+        logging.info("Error Indexer: Hooked printer.gcode.script API")
 
     def _row_get(self, row: Tuple[Any, ...], idx: int) -> str:
-        """取行第 idx 列，转为 str 并 strip。"""
+        """Get the value from the row at index idx, convert to str and strip."""
         if idx < len(row):
             val = row[idx]
             return str(val).strip() if val is not None else ""
         return ""
 
     def _parse_placeholders(self, template: str) -> List[str]:
-        """从第二列模板按首次出现顺序解析占位符，如 ['%1','%2','%3']。"""
+        """Parse placeholders from the template in the second column, e.g. ['%1','%2','%3']."""
         return list(dict.fromkeys(f"%{m.group(1)}" for m in PLACEHOLDER_RE.finditer(template)))
 
     def _build_msg_re(self, template: str, placeholders: List[str]) -> Optional[re.Pattern]:
-        """构建匹配用正则：%N 首次出现为 (.*?)，再次出现为反向引用。re.escape 不转义 %，故按 %N 分割后分段转义。"""
+        """Build regex for matching: %N appears as (.*?) first, then as a backreference. re.escape does not escape %, so escape %N segments separately."""
         if not template:
             return None
         if not placeholders:
@@ -167,20 +171,20 @@ class ErrorIndexer:
             return None
 
     def _load_error_db(self) -> None:
-        """从 xlsx 指定 sheet 加载错误表（跳过首行）。"""
+        """Load error table from xlsx specified sheet (skipping first row)."""
         if not os.path.exists(self.file_path):
-            logging.warning("Error Indexer: 在 %s 未找到 xlsx 文件", self.file_path)
+            logging.warning("Error Indexer: xlsx file not found: %s", self.file_path)
             return
         try:
             from openpyxl import load_workbook
         except ImportError:
-            logging.error("Error Indexer: 需要 openpyxl 才能读取 xlsx，请安装 openpyxl")
+            logging.error("Error Indexer: Need openpyxl to read xlsx, please install openpyxl")
             return
         try:
             wb = load_workbook(self.file_path, read_only=True, data_only=True)
             if self.sheet_name not in wb.sheetnames:
                 logging.warning(
-                    "Error Indexer: xlsx 中未找到表格 %r，可用: %s",
+                    "Error Indexer: xlsx file not found %r, available sheets: %s",
                     self.sheet_name, wb.sheetnames,
                 )
                 wb.close()
@@ -214,11 +218,11 @@ class ErrorIndexer:
             wb.close()
             if self.error_db:
                 logging.info(
-                    "Error Indexer: 从 xlsx 成功加载 %d 条错误记录。",
+                    "Error Indexer: Successfully loaded %d error records from xlsx",
                     len(self.error_db),
                 )
         except Exception as e:
-            logging.error("Error Indexer: 加载 xlsx 失败: %s", e)
+            logging.error("Error Indexer: Failed to load xlsx: %s", e)
 
     def _parse_multi_lang(self, text: str) -> Dict[str, str]:
         """解析多语言字符串，支持 xx-XX: 或 xx-XX： 开头，每行一种语言。"""
@@ -280,8 +284,8 @@ class ErrorIndexer:
         return None
 
     def _handle_gcode_response(self, response: str) -> None:
-        """处理 G-code 响应，!! 开头视为标准错误并匹配。"""
-        logging.debug(f"Error Indexer 收到响应: {response}")
+        """Process G-code response, !!开头视为标准错误并匹配."""
+        logging.debug(f"Error Indexer: Received response: {response}")
 
         clean_response = response.strip()
         clean_msg = clean_response[2:].strip() if clean_response.startswith("!!") else clean_response
@@ -290,27 +294,87 @@ class ErrorIndexer:
             code, groups = match_result
             self._process_error(clean_msg, response, code=code, placeholder_values=groups)
         elif clean_response.startswith("!!"):
-            logging.info("Error Indexer: 标准错误未命中数据库，按 UNKNOWN 处理: %s", clean_msg)
+            logging.info("Error Indexer: Standard error not found in database, processing as UNKNOWN: %s", clean_msg)
             self._process_error(clean_msg, response, None)
 
     async def _handle_status_update(self, status: Dict[str, Any]) -> None:
-        """webhooks.state 为 shutdown/error 时，用 state_message 匹配并通知。"""
+        """处理来自 notify_status_update 的状态：
+        - webhooks.state 为 shutdown/error 时，使用 state_message 匹配并通知
+        - print_stats.state 为 error 时，使用其中的 message 匹配并通知
+        """
+        # 1) 处理 webhooks 的关机/错误信息
         wh = status.get("webhooks")
-        if not isinstance(wh, dict):
+        if isinstance(wh, dict):
+            state = wh.get("state")
+            if state in WEBHOOK_ERROR_STATES:
+                state_message = wh.get("state_message", "")
+                if state_message:
+                    match_result = self._match_error_code(state_message)
+                    original_response = (
+                        f"webhooks.state={state}, state_message={state_message}"
+                    )
+                    if match_result:
+                        code, groups = match_result
+                        self._process_error(
+                            state_message,
+                            original_response,
+                            code=code,
+                            placeholder_values=groups,
+                        )
+                    else:
+                        self._process_error(state_message, original_response, None)
+
+        # 2) 处理 print_stats 的错误信息（例如预检查/预备阶段失败）
+        ps = status.get("print_stats")
+        if isinstance(ps, dict) and ps.get("state") == "error":
+            message = ps.get("message", "") or ""
+            if not message:
+                return
+            # 构造一个尽量接近文档示例的原始载荷，方便上位机调试
+            origin_ps = {
+                "filename": ps.get("filename"),
+                "info": ps.get("info"),
+                "message": message,
+                "state": ps.get("state"),
+                "total_duration": ps.get("total_duration"),
+            }
+            original_response = f"print_stats.error={origin_ps!r}"
+            # 使用 message 走统一的错误码匹配和占位符替换流程
+            match_result = self._match_error_code(message)
+            if match_result:
+                code, groups = match_result
+                self._process_error(
+                    message,
+                    original_response,
+                    code=code,
+                    placeholder_values=groups,
+                )
+            else:
+                self._process_error(message, original_response, None)
+
+    def _handle_precheck_failed(self, payload: Dict[str, Any]) -> None:
+        """处理预检查失败事件，由 klippy_apis._run_precheck 发出。"""
+        message = (payload.get("message") or "").strip()
+        if not message:
             return
-        state = wh.get("state")
-        if state not in WEBHOOK_ERROR_STATES:
-            return
-        state_message = wh.get("state_message", "")
-        if not state_message:
-            return
-        match_result = self._match_error_code(state_message)
-        original_response = f"webhooks.state={state}, state_message={state_message}"
+        step = payload.get("step", "precheck")
+        http_code = payload.get("http_code")
+        data = payload.get("data")
+        extra = {"step": step, "http_code": http_code}
+        if data is not None:
+            extra["data"] = data
+        original_response = f"precheck:failed={extra!r}"
+        match_result = self._match_error_code(message)
         if match_result:
             code, groups = match_result
-            self._process_error(state_message, original_response, code=code, placeholder_values=groups)
+            self._process_error(
+                message,
+                original_response,
+                code=code,
+                placeholder_values=groups,
+            )
         else:
-            self._process_error(state_message, original_response, None)
+            self._process_error(message, original_response, None)
 
     def _process_error(
         self,
@@ -319,7 +383,7 @@ class ErrorIndexer:
         code: Optional[str] = None,
         placeholder_values: Optional[Tuple[str, ...]] = None,
     ) -> None:
-        """处理检测到的错误。"""
+        """Process detected error."""
         if not code:
             match_result = self._match_error_code(error_msg)
             if match_result:
@@ -356,7 +420,7 @@ class ErrorIndexer:
         }
         
         self.server.send_event("error_indexer:error_detected", payload)
-        logging.info(f"Error Indexer: 检测到错误 {code} - {error_msg}")
+        logging.info(f"Error Indexer: Error detected: {code} - {error_msg}")
 
     def _get_description(
         self,
@@ -401,7 +465,7 @@ class ErrorIndexer:
                     400,
                 )
             self.language = normalized
-            logging.info("Error Indexer: 语言切换为 %s", self.language)
+            logging.info("Error Indexer: Language changed to %s", self.language)
             await self._persist_language()
             
         return {"language": self.language}
