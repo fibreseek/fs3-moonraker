@@ -27,12 +27,17 @@ class ErrorIndexer:
         self.file_path = self._get_file_path(config)
         # 默认读取 xlsx 中名为 "klipper" 的表格，可通过配置覆盖
         self.sheet_name = config.get("sheet_name", "klipper")
+        # AI 错误单独使用 ai sheet，可通过配置覆盖
+        self.ai_sheet_name = config.get("ai_sheet_name", "ai")
         # 获取语言设置
         self.language = config.get("language", "en-US")
         # 错误数据库
         self.error_db: Dict[str, Dict[str, Any]] = {}
+        # AI 错误数据库（来自单独的 ai sheet）
+        self.ai_error_db: Dict[str, Dict[str, Any]] = {}
         # 加载错误数据库
         self._load_error_db()
+        self._load_ai_error_db()
         logging.info(
             "Error Indexer: Component loaded (module=%s, file_path=%s, language=%s, db_size=%d)",
             __file__, self.file_path, self.language, len(self.error_db)
@@ -69,6 +74,10 @@ class ErrorIndexer:
         # 3) 捕获预检查失败（klippy_apis 在 _run_precheck 中发出）
         self.server.register_event_handler(
             "precheck:failed", self._handle_precheck_failed
+        )
+        # 4) 捕获 AI 检测结果事件（由 ai_detection 组件发送）
+        self.server.register_event_handler(
+            "ai_detection:detection_result", self._handle_ai_detection_result
         )
 
     # 注册 REST API 端点
@@ -196,7 +205,7 @@ class ErrorIndexer:
             wb = load_workbook(self.file_path, read_only=True, data_only=True)
             if self.sheet_name not in wb.sheetnames:
                 logging.warning(
-                    "Error Indexer: xlsx file not found %r, available sheets: %s",
+                    "Error Indexer: xlsx sheet %r not found, available sheets: %s",
                     self.sheet_name, wb.sheetnames,
                 )
                 wb.close()
@@ -230,11 +239,61 @@ class ErrorIndexer:
             wb.close()
             if self.error_db:
                 logging.info(
-                    "Error Indexer: Successfully loaded %d error records from xlsx",
+                    "Error Indexer: Successfully loaded %d error records from xlsx sheet %s",
                     len(self.error_db),
+                    self.sheet_name,
                 )
         except Exception as e:
             logging.error("Error Indexer: Failed to load xlsx: %s", e)
+
+    def _load_ai_error_db(self) -> None:
+        """Load AI error table from dedicated ai sheet."""
+        if not os.path.exists(self.file_path):
+            return
+        try:
+            from openpyxl import load_workbook
+        except ImportError:
+            # 主库已经在 _load_error_db 中报过一次，这里安静失败即可
+            return
+        try:
+            wb = load_workbook(self.file_path, read_only=True, data_only=True)
+            if self.ai_sheet_name not in wb.sheetnames:
+                wb.close()
+                return
+            ws = wb[self.ai_sheet_name]
+            self.ai_error_db = {}
+            for row in ws.iter_rows(min_row=2, values_only=True):
+                row = tuple(row) if row else ()
+                if not row:
+                    continue
+                code = self._row_get(row, 0)
+                if code.startswith("\ufeff"):
+                    code = code[1:]
+                if len(row) < 2:
+                    continue
+                if not code:
+                    continue
+                msg_match = self._row_get(row, 1)
+                placeholders = self._parse_placeholders(msg_match)
+                msg_re = self._build_msg_re(msg_match, placeholders)
+                entry = {
+                    "code": code,
+                    "msg_match": msg_match,
+                    "placeholders": placeholders,
+                    "msg_re": msg_re,
+                    "msg_multi": self._parse_multi_lang(self._row_get(row, 2)),
+                    "solution_multi": self._parse_solution(self._row_get(row, 3)),
+                }
+                self.ai_error_db[code] = entry
+            wb.close()
+            if self.ai_error_db:
+                logging.info(
+                    "Error Indexer: Successfully loaded %d AI error records from xlsx sheet %s",
+                    len(self.ai_error_db),
+                    self.ai_sheet_name,
+                )
+        except Exception as e:
+            logging.error("Error Indexer: Failed to load AI xlsx sheet %s: %s", self.ai_sheet_name, e)
 
     def _parse_multi_lang(self, text: str) -> Dict[str, str]:
         """解析多语言字符串，支持 xx-XX: 或 xx-XX： 开头，每行一种语言。"""
@@ -282,9 +341,13 @@ class ErrorIndexer:
             return {"en-US": raw}
         return self._parse_multi_lang(raw)
 
-    def _match_error_code(self, message: str) -> Optional[Tuple[str, Tuple[str, ...]]]:
-        """匹配错误消息，返回 (code, 占位符捕获值) 或 None。"""
-        for code, entry in self.error_db.items():
+    def _match_error_code_in_db(
+        self,
+        message: str,
+        db: Dict[str, Dict[str, Any]],
+    ) -> Optional[Tuple[str, Tuple[str, ...]]]:
+        """在指定错误库中匹配错误消息，返回 (code, 占位符捕获值) 或 None。"""
+        for code, entry in db.items():
             msg_re = entry.get("msg_re")
             if msg_re is None:
                 continue
@@ -294,6 +357,10 @@ class ErrorIndexer:
             groups = m.groups() if m.lastindex else ()
             return (code, groups)
         return None
+
+    def _match_error_code(self, message: str) -> Optional[Tuple[str, Tuple[str, ...]]]:
+        """匹配主错误库（klipper sheet）中的错误消息。"""
+        return self._match_error_code_in_db(message, self.error_db)
 
     def _handle_gcode_response(self, response: str) -> None:
         """Process G-code response, !!开头视为标准错误并匹配."""
@@ -388,20 +455,70 @@ class ErrorIndexer:
         else:
             self._process_error(message, original_response, None)
 
+    def _handle_ai_detection_result(self, payload: Dict[str, Any]) -> None:
+        """处理来自 ai_detection 组件的检测结果事件。
+
+        该事件由 AIDetectionClient._send_detection_notification 发送，payload 示例:
+            {
+                "scenario": "printing_defect_periodic",
+                "detection_type": "defect",
+                "message": "Defect detected: spaghetti"
+            }
+        这里将其统一转换为 error_indexer:error_detected 通知，便于上位机展示。
+        """
+        if not isinstance(payload, dict):
+            return
+
+        message = (payload.get("message") or "").strip()
+        if not message:
+            return
+
+        scenario = payload.get("scenario") or ""
+        detection_type = payload.get("detection_type") or ""
+        original_response = (
+            f"ai_detection:detection_result "
+            f"scenario={scenario}, detection_type={detection_type}, message={message}"
+        )
+
+        # 优先在 AI sheet 中进行错误码匹配
+        match_result = self._match_error_code_in_db(message, self.ai_error_db) \
+            if self.ai_error_db else None
+
+        if match_result:
+            code, groups = match_result
+            self._process_error(
+                message,
+                original_response,
+                code=code,
+                placeholder_values=groups,
+                error_db=self.ai_error_db,
+            )
+        else:
+            # 未匹配到时仍然走统一流程，但使用 AI 错误库，
+            # 最终会落到 UNKNOWN，description 为原始 message。
+            self._process_error(
+                message,
+                original_response,
+                error_db=self.ai_error_db,
+            )
+
     def _process_error(
         self,
         error_msg: str,
         original_response: str,
         code: Optional[str] = None,
         placeholder_values: Optional[Tuple[str, ...]] = None,
+        error_db: Optional[Dict[str, Dict[str, Any]]] = None,
     ) -> None:
         """Process detected error."""
+        db = error_db or self.error_db
         if not code:
-            match_result = self._match_error_code(error_msg)
+            # 按给定错误库匹配
+            match_result = self._match_error_code_in_db(error_msg, db)
             if match_result:
                 code, placeholder_values = match_result
             else:
-                for c, ent in self.error_db.items():
+                for c, ent in db.items():
                     msg_match = ent.get("msg_match")
                     if msg_match and msg_match in error_msg:
                         code = c
@@ -411,7 +528,7 @@ class ErrorIndexer:
         if placeholder_values is None:
             placeholder_values = ()
 
-        entry = self.error_db.get(code, {})
+        entry = db.get(code, {})
 
         if code == "UNKNOWN":
             description = error_msg
@@ -420,6 +537,9 @@ class ErrorIndexer:
             description = self._get_description(
                 entry, self.language, placeholder_values=placeholder_values
             )
+            # 若当前语言没有对应文本，则按需求回退到原始错误信息
+            if not description:
+                description = error_msg
             solution = self._get_solution(entry, self.language)
         
         payload = {

@@ -82,7 +82,33 @@ class JobState:
                 # should register handlers for "job_state: status_changed" and
                 # match against the JobEvent object provided.
                 self.server.send_event(f"job_state:{new_state}", prev_ps, new_ps)
-                self.last_event = JobEvent.from_string(new_state)
+                # 将 Klipper 的 print_stats.state 映射到 JobEvent
+                try:
+                    # 优先直接用字符串映射（兼容 started/resumed 等派生状态）
+                    self.last_event = JobEvent.from_string(new_state)
+                except ValueError:
+                    # 对已知的扩展状态做显式映射，避免简单回退为 STANDBY
+                    if new_state == "precheck":
+                        self.last_event = getattr(
+                            JobEvent, "PRECHECK", JobEvent.STANDBY
+                        )
+                    elif new_state == "preprinting":
+                        self.last_event = getattr(
+                            JobEvent, "PREPRINTING", JobEvent.STANDBY
+                        )
+                    elif new_state == "pausing":
+                        # 没有 PAUSING 枚举时退化为 PAUSED
+                        self.last_event = getattr(
+                            JobEvent, "PAUSING",
+                            getattr(JobEvent, "PAUSED", JobEvent.STANDBY)
+                        )
+                    else:
+                        # 其它未来状态兜底为 STANDBY，同时打日志
+                        logging.warning(
+                            "JobState: unknown job event state '%s', "
+                            "falling back to STANDBY", new_state
+                        )
+                        self.last_event = JobEvent.STANDBY
                 self.server.send_event(
                     "job_state:state_changed",
                     self.last_event,

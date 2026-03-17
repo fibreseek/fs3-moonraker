@@ -115,24 +115,30 @@ class ExtendedEnum(Enum):
 
 class JobEvent(ExtendedEnum):
     STANDBY = 1
-    STARTED = 2
-    PAUSED = 3
-    RESUMED = 4
-    COMPLETE = 5
-    ERROR = 6
-    CANCELLED = 7
+    PRECHECK = 2
+    PREPRINTING = 3
+    PAUSING = 4
+    STARTED = 10
+    PAUSED = 20
+    RESUMED = 30
+    COMPLETE = 40
+    ERROR = 50
+    CANCELLED = 60
 
     @property
     def finished(self) -> bool:
-        return self.value >= 5
+        # 仅在打印流程真正结束（完成/错误/取消）时视为 finished
+        return self in (JobEvent.COMPLETE, JobEvent.ERROR, JobEvent.CANCELLED)
 
     @property
     def aborted(self) -> bool:
-        return self.value >= 6
+        # 仅错误或被取消的作业视为 aborted
+        return self in (JobEvent.ERROR, JobEvent.CANCELLED)
 
     @property
     def is_printing(self) -> bool:
-        return self.value in [2, 4]
+        # 仍只把 STARTED/RESUMED 视为“正在打印”，保持原有语义
+        return self in (JobEvent.STARTED, JobEvent.RESUMED)
 
 class KlippyState(ExtendedEnum):
     DISCONNECTED = 1

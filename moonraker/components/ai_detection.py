@@ -546,19 +546,19 @@ class AIDetectionClient:
         self,
         scenario: DetectionScenario,
         detection_type: str,
-        result: Dict[str, Any]
+        message: str
     ) -> None:
         """发送带场景标识的检测结果通知
 
         Args:
             scenario: 检测场景
             detection_type: 检测类型 (defect 或 foreign_object)
-            result: 检测结果
+            message: 检测结果消息
         """
         notification_data = {
             "scenario": scenario.value,
             "detection_type": detection_type,
-            "result": result
+            "message": message
         }
         self.server.send_event(
             "ai_detection:detection_result",
@@ -688,7 +688,23 @@ class AIDetectionClient:
                     fut.set_result(response.get("data", {}))
                 elif response_type == "error":
                     error_msg = response.get("message", "Unknown error")
-                    logging.warning(f"AI 检测: 响应错误 - {error_msg}")
+                    logging.warning(f"AI Detection: response error - {error_msg}")
+
+                    # 根据 request_id 粗略推断检测类型，用于统一错误通知
+                    detection_type = "unknown"
+                    if request_id.startswith(DetectionType.DEFECT_DETECT.value):
+                        detection_type = "defect"
+                    elif request_id.startswith(DetectionType.FOREIGN_OBJECT_DETECT.value):
+                        detection_type = "foreign_object"
+
+                    # 通过 ai_detection:detection_result 推送错误信息，
+                    # 由 error_indexer 组件进行统一检索和上报
+                    self._send_detection_notification(
+                        scenario=DetectionScenario.UNKNOWN,
+                        detection_type=detection_type,
+                        message=error_msg,
+                    )
+
                     fut.set_exception(
                         self.server.error(
                             f"AI Detection error: {error_msg}", 500)
@@ -829,14 +845,6 @@ class AIDetectionClient:
                 f"置信度: {result.scores}"
             )
 
-        # 只在 warning=True 时发送通知
-        if send_notification and result.warning:
-            self._send_detection_notification(
-                scenario=scenario,
-                detection_type="defect",
-                result=result.to_dict()
-            )
-
         return result
 
     async def detect_foreign_object(
@@ -845,7 +853,7 @@ class AIDetectionClient:
         nms_thresh: Optional[float] = None,
         scenario: DetectionScenario = DetectionScenario.PREPRINT_FOREIGN_OBJECT,
         send_notification: bool = True
-    ) -> ForeignDetectionResult:
+    ) -> str:
         """执行打印前平台异物检测
 
         Args:
@@ -855,11 +863,20 @@ class AIDetectionClient:
             send_notification: 是否发送通知
 
         Returns:
-            ForeignDetectionResult: 异物检测结果
+            str: 异物检测结果 ok 或 error
         """
         if not self.is_connected:
-            # 返回无异物结果，允许打印继续
-            return ForeignDetectionResult(is_valid=False, has_object=False)
+            msg = "AI Detection service is not connected"
+            self._send_detection_notification(
+                scenario=DetectionScenario.PREPRINT_FOREIGN_OBJECT,
+                detection_type="foreign_object",
+                message=msg
+            )
+            return "error"
+        # AI 检测是否启用
+        if not self.is_enabled():
+            logging.info("AI Detection is disabled, skipping foreign object detection")
+            return "ok"
 
         params = DetectionParams(
             obj_thresh=obj_thresh if obj_thresh is not None else self.obj_thresh,
@@ -871,22 +888,44 @@ class AIDetectionClient:
         )
         result = ForeignDetectionResult.from_dict(result_data)
 
-        if result.has_object:
-            logging.warning(
-                f"AI Detection: Foreign object detected - "
-                f"Class: {result.classes}, Box: {result.boxes}, "
-                f"Score: {result.scores}"
-            )
+        logging.warning(
+            f"AI Detection: Foreign object detected - "
+            f"Class: {result.classes}, Box: {result.boxes}, "
+            f"Score: {result.scores}"
+        )
 
-        # 根据场景决定是否发送通知
-        if send_notification and result.is_valid:
-            self._send_detection_notification(
-                scenario=scenario,
-                detection_type="foreign_object",
-                result=result.to_dict()
+        # 1.1 平台异物检查结果
+        if result.is_valid:
+            if result.has_object:
+                if result.no_build_plate:
+                    msg = ("AI Detection: Build plate not detected")
+                    logging.warning(msg)
+                    self._send_detection_notification(
+                        scenario=DetectionScenario.PREPRINT_FOREIGN_OBJECT,
+                        detection_type="foreign_object",
+                        message=msg
+                    )
+                    return "error"
+                else:
+                    msg = ("AI Detection: Foreign object detected")
+                    logging.warning(msg)
+                    self._send_detection_notification(
+                        scenario=DetectionScenario.PREPRINT_FOREIGN_OBJECT,
+                        detection_type="foreign_object",
+                        message=msg
+                    )
+                    return "error"
+            else:
+                logging.info("AI Detection: No foreign objects detected")
+                return "ok"
+        else:
+            # 未检测到异物，继续打印
+            msg = (
+                "AI Detection: No foreign objects detected"
             )
+            logging.info(msg)
 
-        return result
+        return "ok"
 
     async def connect(self) -> bool:
         """手动连接到 AI 服务"""
@@ -1334,11 +1373,18 @@ class AIDetectionClient:
                 f"Classes: {result.classes}, Boxes: {result.boxes}"
             )
 
+            # 根据result解析
+            class_registry = get_class_registry()
+            class_names = [class_registry.get_defect_name(cls) for cls in result.classes]
+            defect_types = ", ".join(class_names)
+            message = f"Defect detected: {defect_types}"
+            logging.info(f"AI Detection: Defect message: {message}")
+
             # 发送通知
             self._send_detection_notification(
                 scenario=DetectionScenario.PRINTING_DEFECT_PERIODIC,
                 detection_type="defect",
-                result=result.to_dict()
+                message=message
             )
 
             # 判断是否需要自动暂停

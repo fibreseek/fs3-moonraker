@@ -319,81 +319,26 @@ class KlippyAPI(APITransport):
                 try:
                     # 检查组件是否加载失败
                     if "ai_detection" in self.server.failed_components:
-                        msg = (
-                            "AI Detection component failed to load, "
-                            "foreign object detection unavailable"
-                        )
+                        msg = ("AI Detection component failed to load")
                         self.server.send_event(
                             "precheck:failed",
                             {"message": msg, "step": "ai_detection", "http_code": 503},
                         )
                         raise self.server.error(msg, 503)
                     ai_detection = self.server.lookup_component("ai_detection")
-                    # 检查总开关，未启用则跳过检测
-                    if not ai_detection.is_enabled():
-                        logging.info("AI Detection is disabled, skipping foreign object detection")
-                    else:
-                        # 检查连接状态
-                        if not ai_detection.is_connected:
-                            msg = "AI Detection service is not connected"
-                            self.server.send_event(
-                                "precheck:failed",
-                                {"message": msg, "step": "ai_detection", "http_code": 503},
-                            )
-                            raise self.server.error(msg, 503)
-                        # 检查总开关和异物检测开关
-                        if ai_detection.is_foreign_detect_enabled():
-                            # 调用 AI 异物检测，由 ai_detection 模块统一解析:
-                            # - result.has_object: 是否检测到平台异物
-                            # - result.no_build_plate: 是否未检测到打印底板
-                            result = await ai_detection.detect_foreign_object(send_notification=False)
+                    if ai_detection.is_foreign_detect_enabled():
+                        # 调用 AI 异物检测，由 ai_detection 模块统一解析:
+                        result = await ai_detection.detect_foreign_object(send_notification=True)
 
-                            # 1.1 平台异物检查结果
-                            if result.is_valid:
-                                if getattr(result, "has_object", False):
-                                    if getattr(result, "no_build_plate", False):
-                                        msg = (
-                                            "AI Detection: Build plate not detected, "
-                                            "please install build plate before printing"
-                                        )
-                                        logging.warning(msg)
-                                        self.server.send_event(
-                                            "precheck:failed",
-                                            {
-                                                "message": msg,
-                                                "step": "build_plate",
-                                                "http_code": 403,
-                                                "data": {"has_no_plate": True},
-                                            },
-                                        )
-                                        raise self.server.error("build_plate", 403)
-                                    else:
-                                        msg = (
-                                            "AI Detection: Foreign object detected, "
-                                            "blocking print start"
-                                        )
-                                        logging.warning(msg)
-                                        self.server.send_event(
-                                            "precheck:failed",
-                                            {
-                                                "message": msg,
-                                                "step": "foreign_object",
-                                                "http_code": 403,
-                                                "data": {"has_object": True},
-                                            },
-                                        )
-                                        raise self.server.error("foreign_object", 403)
-                                else:
-                                    logging.info("AI Detection: No foreign objects detected")
-                            else:
-                                # 检测无效（可能未连接），记录警告但继续打印
-                                msg = (
-                                    "AI Detection: Foreign object detection not available, "
-                                    "proceeding with print anyway"
-                                )
-                                logging.warning(msg)
-                        else:
-                            logging.info("AI Detection: Foreign object detection disabled, skipping...")
+                        # 1.1 平台异物检查结果
+                        if result == "error":
+                            msg = ("AI Detection: Foreign object detected, skipping print")
+                            logging.warning(msg)
+                            raise self.server.error(msg, 403)
+                        elif result == "ok":
+                            logging.info("AI Detection: No foreign objects detected, proceeding with print")
+                    else:
+                        logging.info("AI Detection: Foreign object detection disabled, skipping...")
                 except self.server.error:
                     raise
                 except Exception as e:
@@ -407,21 +352,21 @@ class KlippyAPI(APITransport):
                 try:
                     # 根据 print_mode 选择需要检查的传感器
                     filament_sensors: List[str] = []
-                    print_mode_text = ""
+                    extruder_text = ""
                     if print_mode == 0:  # Plastic Only
-                        print_mode_text = "High Speed Mode"
+                        extruder_text = "Right Extruder"
                         filament_sensors = [
                             "filament_switch_sensor filament_sensor_3",
                         ]
                     elif print_mode == 1: # Plastic and Composite
-                        print_mode_text = "High Strength Mode"
+                        extruder_text = "Left and Right Extruder"
                         filament_sensors = [
                             "filament_switch_sensor filament_sensor",
                             "filament_switch_sensor filament_sensor_1",
                             "filament_switch_sensor filament_sensor_3",
                         ]
                     elif print_mode == 2: # Composite Only
-                        print_mode_text = "Hyper Strength Mode"
+                        extruder_text = "Left Extruder"
                         filament_sensors = [
                             "filament_switch_sensor filament_sensor",
                             "filament_switch_sensor filament_sensor_1", 
@@ -449,7 +394,7 @@ class KlippyAPI(APITransport):
                                     missing.append(name)
 
                             if missing:
-                                msg = (f"Print Mode:{print_mode_text}, detected missing filament.")
+                                msg = (f"{extruder_text} detected missing filament")
                                 logging.warning("%s. Missing sensors: %s", msg, ", ".join(missing))
                                 self.server.send_event(
                                     "precheck:failed",
@@ -489,7 +434,7 @@ class KlippyAPI(APITransport):
                         enabled = bool(obj.get("enabled", True))
 
                         if enabled and not door_closed:
-                            msg = "The current printing task requires maintaining the cavity temperature, and it is detected that the door is not closed."
+                            msg = "Door is not closed with the chamber temperature"
                             logging.warning(msg)
                             self.server.send_event(
                                 "precheck:failed",
