@@ -270,6 +270,34 @@ class MoonrakerDatabase:
         #    "/debug/database/row", RequestType.all(),
         #    self._handle_row_request
         # )
+        # Register subscription endpoints
+        self.server.register_endpoint(
+            "/server/database/subscribe", RequestType.POST, self._handle_subscribe_request
+        )
+        self.server.register_endpoint(
+            "/server/database/unsubscribe", RequestType.POST, self._handle_unsubscribe_request
+        )
+        # Register event handler for database changes
+        self.server.register_event_handler(
+            "database:data_changed",
+            self._handle_data_changed_event
+        )
+        # Register event handler for client disconnect
+        self.server.register_event_handler(
+            "websockets:client_removed",
+            lambda sc: self.remove_client_subscriptions(sc.uid)
+        )
+        # Register batch endpoint
+        self.server.register_endpoint(
+            "/server/database/batch", RequestType.all(), self._handle_batch_request
+        )
+        # Initialize batch notification system
+        self._notification_queue: List[Dict[str, Any]] = []
+        self._notification_timer = None
+        self._notification_lock = Lock()
+        # Initialize subscription management
+        self._subscriptions: Dict[int, Set[str]] = {}  # client_id -> set of namespaces
+        self._subscription_lock = Lock()
 
     async def component_init(self) -> None:
         await self.db_provider.async_init()
@@ -623,11 +651,24 @@ class MoonrakerDatabase:
             )
         if req_type == RequestType.GET:
             key = web_request.get("key", None)
-            if key is not None and not isinstance(key, (list, str)):
-                raise self.server.error(
-                    "Value for argument 'key' is an invalid type: "
-                    f"{type(key).__name__}"
-                )
+            if key is not None:
+                # Validate key type
+                if isinstance(key, list):
+                    # Check if list is empty
+                    if not key:
+                        raise self.server.error("Value for argument 'key' cannot be an empty list")
+                    # Check if all elements are strings
+                    for i, item in enumerate(key):
+                        if not isinstance(item, str):
+                            raise self.server.error(
+                                f"Value for argument 'key' at index {i} is an invalid type: "
+                                f"{type(item).__name__}"
+                            )
+                elif not isinstance(key, str):
+                    raise self.server.error(
+                        "Value for argument 'key' is an invalid type: "
+                        f"{type(key).__name__}"
+                    )
             val = await self.get_item(namespace, key)
         else:
             if namespace in self.protected_namespaces and not is_debug:
@@ -635,7 +676,19 @@ class MoonrakerDatabase:
                     f"Write access to namespace '{namespace}' is forbidden", 403
                 )
             key = web_request.get("key")
-            if not isinstance(key, (list, str)):
+            # Validate key type
+            if isinstance(key, list):
+                # Check if list is empty
+                if not key:
+                    raise self.server.error("Value for argument 'key' cannot be an empty list")
+                # Check if all elements are strings
+                for i, item in enumerate(key):
+                    if not isinstance(item, str):
+                        raise self.server.error(
+                            f"Value for argument 'key' at index {i} is an invalid type: "
+                            f"{type(item).__name__}"
+                        )
+            elif not isinstance(key, str):
                 raise self.server.error(
                     "Value for argument 'key' is an invalid type: "
                     f"{type(key).__name__}"
@@ -661,6 +714,77 @@ class MoonrakerDatabase:
                 log=False
             )
         return {'namespace': namespace, 'key': key, 'value': val}
+
+    async def _handle_batch_request(self, web_request: WebRequest) -> Dict[str, Any]:
+        """Handle batch operations: get, update, delete"""
+        req_type = web_request.get_request_type()
+        is_debug = web_request.get_endpoint().startswith("/debug/")
+        namespace = web_request.get_str("namespace")
+        
+        # Check namespace access
+        if namespace in self.forbidden_namespaces and not is_debug:
+            raise self.server.error(
+                f"Access to namespace '{namespace}' is forbidden", 403
+            )
+        
+        if req_type == RequestType.GET:
+            # Batch get operation
+            keys = web_request.get_list("keys")
+            # Validate keys
+            if not keys:
+                raise self.server.error("Value for argument 'keys' cannot be an empty list")
+            for i, key in enumerate(keys):
+                if not isinstance(key, str):
+                    raise self.server.error(
+                        f"Value for argument 'keys' at index {i} is an invalid type: "
+                        f"{type(key).__name__}"
+                    )
+            records = await self.get_batch(namespace, keys)
+            return {namespace: records}
+        else:
+            # Check write access for POST and DELETE
+            if namespace in self.protected_namespaces and not is_debug:
+                raise self.server.error(
+                    f"Write access to namespace '{namespace}' is forbidden", 403
+                )
+            
+            if req_type == RequestType.POST:
+                # Batch update operation
+                records = web_request.get("records")
+                if not isinstance(records, dict):
+                    raise self.server.error(
+                        "Value for argument 'records' must be a dictionary"
+                    )
+                if not records:
+                    raise self.server.error(
+                        "Value for argument 'records' cannot be an empty dictionary"
+                    )
+                # Validate records
+                for key, value in records.items():
+                    if not isinstance(key, str):
+                        raise self.server.error(
+                            f"Key in 'records' is an invalid type: {type(key).__name__}"
+                        )
+                await self.insert_batch(namespace, records)
+                return  {namespace: records}
+            elif req_type == RequestType.DELETE:
+                # Batch delete operation
+                keys = web_request.get_list("keys")
+                # Validate keys
+                if not keys:
+                    raise self.server.error("Value for argument 'keys' cannot be an empty list")
+                for i, key in enumerate(keys):
+                    if not isinstance(key, str):
+                        raise self.server.error(
+                            f"Value for argument 'keys' at index {i} is an invalid type: "
+                            f"{type(key).__name__}"
+                        )
+                records = await self.delete_batch(namespace, keys)
+                # Check if namespace is empty after deletion
+                await self.drop_empty_namespace(namespace)
+                return  {namespace: records}
+            else:
+                raise self.server.error(f"Invalid request type {req_type}")
 
     async def close(self) -> None:
         if not self.db_provider.is_restored():
@@ -734,6 +858,145 @@ class MoonrakerDatabase:
         return {
             "row": item
         }
+
+
+
+    def subscribe_namespace(self, client_id: int, namespace: str) -> None:
+        """Subscribe a client to a namespace"""
+        async def _subscribe():
+            async with self._subscription_lock:
+                if client_id not in self._subscriptions:
+                    self._subscriptions[client_id] = set()
+                self._subscriptions[client_id].add(namespace)
+                logging.info(f"Client {client_id} subscribed to namespace {namespace}")
+        self.eventloop.create_task(_subscribe())
+
+    def unsubscribe_namespace(self, client_id: int, namespace: str) -> None:
+        """Unsubscribe a client from a namespace"""
+        async def _unsubscribe():
+            async with self._subscription_lock:
+                if client_id in self._subscriptions:
+                    self._subscriptions[client_id].discard(namespace)
+                    # Remove client if no more subscriptions
+                    if not self._subscriptions[client_id]:
+                        del self._subscriptions[client_id]
+                    logging.info(f"Client {client_id} unsubscribed from namespace {namespace}")
+        self.eventloop.create_task(_unsubscribe())
+
+    def remove_client_subscriptions(self, client_id: int) -> None:
+        """Remove all subscriptions for a client"""
+        async def _remove():
+            async with self._subscription_lock:
+                if client_id in self._subscriptions:
+                    del self._subscriptions[client_id]
+                    logging.info(f"Removed all subscriptions for client {client_id}")
+        self.eventloop.create_task(_remove())
+
+    async def _handle_subscribe_request(self, web_request: WebRequest) -> Dict[str, Any]:
+        """Handle subscribe request"""
+        sc = web_request.get_client_connection()
+        if sc is None:
+            raise self.server.error("No client connection", 400)
+        
+        # Get namespaces list
+        namespaces = web_request.get_list("namespaces")
+        
+        # Validate list is not empty
+        if not namespaces:
+            raise self.server.error("Value for argument 'namespaces' cannot be an empty list", 400)
+        
+        # Validate all elements are strings
+        for i, ns in enumerate(namespaces):
+            if not isinstance(ns, str):
+                raise self.server.error(
+                    f"Value for argument 'namespaces' at index {i} is an invalid type: "
+                    f"{type(ns).__name__}", 400
+                )
+        
+        # Subscribe to all namespaces
+        for ns in namespaces:
+            self.subscribe_namespace(sc.uid, ns)
+        
+        return {"result": "success", "namespaces": namespaces}
+
+    async def _handle_unsubscribe_request(self, web_request: WebRequest) -> Dict[str, Any]:
+        """Handle unsubscribe request"""
+        sc = web_request.get_client_connection()
+        if sc is None:
+            raise self.server.error("No client connection", 400)
+        
+        # Get namespaces list
+        namespaces = web_request.get_list("namespaces")
+        
+        # Validate list is not empty
+        if not namespaces:
+            raise self.server.error("Value for argument 'namespaces' cannot be an empty list", 400)
+        
+        # Validate all elements are strings
+        for i, ns in enumerate(namespaces):
+            if not isinstance(ns, str):
+                raise self.server.error(
+                    f"Value for argument 'namespaces' at index {i} is an invalid type: "
+                    f"{type(ns).__name__}", 400
+                )
+        
+        # Unsubscribe from all namespaces
+        for ns in namespaces:
+            self.unsubscribe_namespace(sc.uid, ns)
+        
+        return {"result": "success", "namespaces": namespaces}
+
+    def _get_subscribed_clients(self, namespace: str) -> List[int]:
+        """Get list of clients subscribed to a namespace"""
+        subscribed_clients = []
+        for client_id, namespaces in self._subscriptions.items():
+            if namespace in namespaces:
+                subscribed_clients.append(client_id)
+        return subscribed_clients
+
+    def _handle_data_changed_event(self, data: Dict[str, Any]) -> None:
+        """Handle database data changed event and queue for batch notification"""
+        logging.info(f"Database data changed: {data}")
+        async def batch_notify():
+            """Batch notify clients with database changes"""
+            async with self._notification_lock:
+                if not self._notification_queue:
+                    logging.info("No notifications to send")
+                    return
+                # Create a copy of the queue and clear it
+                notifications = self._notification_queue.copy()
+                self._notification_queue.clear()
+                # Deduplicate notifications and group by namespace
+                namespace_notifications = {}
+                for notification in notifications:
+                    namespace = notification['namespace']
+                    if namespace not in namespace_notifications:
+                        namespace_notifications[namespace] = {}
+                    namespace_notifications[namespace].update(notification['records'])
+                # Notify subscribed clients for each namespace
+                wsm = self.server.lookup_component("websockets")
+                for namespace, records in namespace_notifications.items():
+                    subscribed_clients = self._get_subscribed_clients(namespace)
+                    if subscribed_clients:
+                        wsm.notify_specified_clients(
+                            "database_changed",
+                            [{namespace: records}],
+                            subscribed_clients
+                        )
+                # Reset notification timer
+                self._notification_timer = None
+        # Add to notification queue
+        async def add_to_queue():
+            async with self._notification_lock:
+                self._notification_queue.append(data)
+                # Start timer if not already running
+                if self._notification_timer is None:
+                    self._notification_timer = self.eventloop.delay_callback(
+                        0.1,  # 100ms delay for batching
+                        lambda: self.eventloop.create_task(batch_notify())
+                    )
+        # Run in event loop
+        self.eventloop.create_task(add_to_queue())
 
 class SqliteProvider(Thread):
     def __init__(self, config: ConfigHelper, db_path: pathlib.Path) -> None:
@@ -1085,6 +1348,22 @@ class SqliteProvider(Thread):
             logging.info(f"Error inserting key '{key}' in namespace '{namespace}'")
         else:
             self._namespaces.add(namespace)
+            # Send data change event
+            if isinstance(key, list):
+                new_key = key[0]
+                for i in range(1, len(key_list)):
+                    new_key += "." + key_list[i]
+            else:
+                new_key = key
+            record = {new_key: value}
+            self.server.send_event(
+                "database:data_changed",
+                {
+                    "namespace": namespace,
+                    "records": record,
+                    "action": "insert"
+                }
+            )
 
     def update_item(
         self,
@@ -1122,6 +1401,23 @@ class SqliteProvider(Thread):
                 item[key_list[-1]] = value
         if not self._insert_record(conn, namespace, key_list[0], record):
             logging.info(f"Error updating key '{key}' in namespace '{namespace}'")
+        else:
+            # Send data change event
+            if isinstance(key, list):
+                new_key = key[0]
+                for i in range(1, len(key_list)):
+                    new_key += "." + key_list[i]
+            else:
+                new_key = key
+            record = {new_key: value}
+            self.server.send_event(
+                "database:data_changed",
+                {
+                    "namespace": namespace,
+                    "records": record,
+                    "action": "update"
+                }
+            )
 
     def delete_item(
         self, conn: sqlite3.Connection, namespace: str, key: Union[List[str], str]
@@ -1190,6 +1486,15 @@ class SqliteProvider(Thread):
                 generate_params()
             )
         self._namespaces.add(namespace)
+        # Send data change event
+        self.server.send_event(
+            "database:data_changed",
+            {
+                "namespace": namespace,
+                "records": records,
+                "action": "insert"
+            }
+        )
 
     def move_batch(
         self,

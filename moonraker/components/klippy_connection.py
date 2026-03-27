@@ -658,6 +658,16 @@ class KlippyConnection:
             result = cmd['result']
             if not result:
                 result = "ok"
+            # Check if this is a response to printer.info request
+            if request.rpc_method == "info":
+                # Add machine_name field from parameter system
+                try:
+                    machine = self.server.lookup_component("machine")
+                    result["machine_name"] = machine.get_machine_name()
+                    result["machine_id"] = machine.get_machine_id()
+                except Exception:
+                    # If failed to get machine name, just skip adding the field
+                    pass
             request.set_result(result)
         else:
             err: Union[str, Dict[str, str]]
@@ -949,8 +959,8 @@ class KlippyRequest:
                     raise ServerError("Klippy request timed out", 500) from None
                 pending_time = time.time() - start_time
                 logging.info(
-                    f"Request '{self.rpc_method}' pending: "
-                    f"{pending_time:.2f} seconds"
+                    f"Request '{self.rpc_method}' params {self.params} "
+                    f"pending: {pending_time:.2f} seconds, continue waiting"
                 )
 
     def set_exception(self, exc: Exception) -> None:

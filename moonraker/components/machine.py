@@ -20,6 +20,8 @@ import distro
 import tempfile
 import getpass
 import configparser
+import hashlib
+import uuid
 from ..confighelper import FileSourceWrapper
 from ..utils import source_info, cansocket, sysfs_devs, load_system_module
 from ..utils import json_wrapper as jsonw
@@ -77,6 +79,7 @@ USB_IDS_URL = "http://www.linux-usb.org/usb.ids"
 
 class Machine:
     def __init__(self, config: ConfigHelper) -> None:
+        self.config = config
         self.server = config.get_server()
         self._allowed_services: List[str] = []
         self._init_allowed_services()
@@ -94,7 +97,13 @@ class Machine:
         if sudo_template is not None:
             self._sudo_password = sudo_template.render()
         self._public_ip = ""
-        self.machine_id: Optional[str] = ""
+
+        self.database: MoonrakerDatabase = self.server.lookup_component("database")
+        # Machine info parameters
+        self._parameters: Dict[str, Any] = {}
+        # Initialize machine_name with default value
+        self._parameters["machine_name"] = "fibre seek printer"
+        self._parameters["machine_id"] = self._gen_machine_id()
         self.system_info: Dict[str, Any] = {
             'python': {
                 "version": tuple(sys.version_info),
@@ -123,10 +132,6 @@ class Machine:
         logging.info(f"Using System Provider: {self.provider_type}")
         self.validator = InstallValidator(config)
         self.sudo_requests: List[Tuple[SudoCallback, str]] = []
-        # Register event handler for Klipper ready
-        self.server.register_event_handler(
-            "server:klippy_ready", self._on_klippy_ready
-        )
 
         self.server.register_endpoint(
             "/machine/reboot", RequestType.POST, self._handle_machine_request
@@ -184,6 +189,119 @@ class Machine:
         self.iwgetid_cmd = shell_cmd.build_shell_command(iwgetbin)
         self.init_evt = asyncio.Event()
         self.libcam = self._try_import_libcamera()
+
+    @staticmethod
+    def _get_cpu_sn():
+        sn = None
+        try:
+            with open('/proc/cpuinfo', 'r') as f:
+                for line in f:
+                    if line.startswith('Serial'):
+                        sn = line.split(':')[1].strip()
+        except FileNotFoundError:
+            logging.error("/proc/cpuinfo not found. Are you on a Linux system and ARM architecture?")
+        except Exception as e:
+            logging.error(f"Error reading /proc/cpuinfo: {e}")
+        logging.debug(f'cpu sn: {sn}')
+        return sn
+
+    @staticmethod
+    def _to_base62(num: int) -> str:
+        BASE62_ALPHABET = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+        if num == 0:
+            return "0"
+        result = []
+        base = len(BASE62_ALPHABET)
+        while num > 0:
+            num, r = divmod(num, base)
+            result.append(BASE62_ALPHABET[r])
+        result.reverse()
+        return ''.join(result)
+
+    def _gen_machine_id(self):
+        cpu_sn = Machine._get_cpu_sn()
+
+        if cpu_sn is not None and len(cpu_sn) == 16:
+            # 16进制字符串转十进制整数
+            cpu_sn_int = int(cpu_sn, 16)
+            # 转62进制
+            machine_id = Machine._to_base62(cpu_sn_int)
+        else:
+            # 其他情况，使用UUID生成12位62进制ID
+            cpu_sn = str(uuid.uuid4())
+            logging.warning(f"Cannot get CPU serial number, using random UUID: {cpu_sn}")
+            sha256 = hashlib.sha256(cpu_sn.encode("utf-8")).digest()
+            hash_num = int.from_bytes(sha256[:12], byteorder="big", signed=False)  # 取12字节适配12位62进制
+            machine_id = Machine._to_base62(hash_num)
+
+        # 统一处理：固定12位长度（不足补0，超长取后12位）
+        if len(machine_id) > 12:
+            machine_id = machine_id[-12:]  # 超长取后12位
+        else:
+            machine_id = machine_id.rjust(12, "0")  # 不足补0
+
+        # 拼接两个字符的机器型号在machine_id的开头
+        machine_type = self.config.get("printer_type_code", "00")
+        machine_id = machine_type + machine_id
+
+        logging.info(f"Generated machine ID: {machine_id}")
+        return machine_id
+
+    def get_machine_id(self) -> str:
+        return self._parameters["machine_id"]
+
+    def get_machine_name(self) -> str:
+        """Get the current machine name"""
+        return self._parameters.get("machine_name", "fibre seek printer")
+
+    async def set_machine_name(self, new_value: str) -> None:
+        """Set the machine name and persist it to database"""
+        # Validate input
+        if not new_value or not isinstance(new_value, str):
+            raise self.server.error("Machine name must be a non-empty string", 400)
+        if len(new_value) > 100:
+            raise self.server.error("Machine name must be less than 100 characters", 400)
+        
+        # Update the value
+        old_value = self._parameters.get("machine_name")
+        if old_value == new_value:
+            return  # No change needed
+        
+        # Persist to database
+        try:
+            await self.database.update_item("fibretouch", "machine_name", new_value)
+            # Update in memory
+            self._parameters["machine_name"] = new_value
+            # Notify other components of the change
+            self.server.send_event("machine:machine_name_changed", new_value)
+        except Exception as e:
+            logging.exception(f"Failed to set machine name: {e}")
+            raise self.server.error(f"Failed to set machine name: {str(e)}", 500)
+
+    async def _load_parameters(self) -> None:
+        """Load parameters from database"""
+        try:
+            # Load machine_name from database, default to "fibre seek printer"
+            machine_name = await self.database.get_item("fibretouch", "machine_name")
+            logging.info(f"machine_name in batabase: {machine_name}")
+            self._parameters["machine_name"] = machine_name
+            # Notify other components of the change
+            self.server.send_event("machine:machine_name_changed", self._parameters["machine_name"])
+        except Exception as e:
+            logging.info(f"Failed to load parameters: {e}")
+            # Set default value if database loading fails
+            await self.database.insert_item("fibretouch", "machine_name", self._parameters["machine_name"])
+
+        try:
+            machine_id = await self.database.get_item("fibretouch", "machine_id")
+            logging.info(f"machine_id in batabase: {machine_id}")
+            self._parameters["machine_id"] = machine_id
+            # Notify other components of the change
+            self.server.send_event("machine:machine_id_changed", self._parameters["machine_id"])
+        except Exception as e:
+            logging.info(f"Failed to load parameters: {e}")
+            # Set default value if database loading fails
+            await self.database.insert_item("fibretouch", "machine_id", self._parameters["machine_id"])
 
     def _init_allowed_services(self) -> None:
         app_args = self.server.get_app_args()
@@ -280,6 +398,8 @@ class Machine:
     async def component_init(self) -> None:
         eventloop = self.server.get_event_loop()
         eventloop.create_task(self.update_usb_ids())
+        # Load parameters from database
+        await self._load_parameters()
         await self.validator.validation_init()
         await self.sys_provider.initialize()
         if not self.inside_container:
@@ -455,6 +575,7 @@ class Machine:
     def get_system_info(self) -> Dict[str, Any]:
         return self.system_info
 
+
     @property
     def sudo_password(self) -> Optional[str]:
         return self._sudo_password
@@ -570,25 +691,6 @@ class Machine:
         except Exception:
             logging.info("Error Reading SDCard CSD Register")
         return sd_info
-
-    async def _on_klippy_ready(self) -> None:
-        """Called when Klipper is ready, fetches machine id from Klipper"""
-        logging.info("Klipper is ready, fetching machine id")
-        try:
-            # Get Klippy API component
-            klippy_apis = self.server.lookup_component("klippy_apis")
-            # Call info endpoint to get machine id
-            info = await klippy_apis.get_klippy_info()
-            if isinstance(info, dict) and "machine_id" in info:
-                self.machine_id = info["machine_id"]
-                logging.info(f"Retrieved machine id from Klipper: {self.machine_id}")
-                # Notify other components
-                self.server.send_event("machine:machine_id_available", self.machine_id)
-            else:
-                logging.warning("Machine id not found in Klipper info")
-                logging.info(f"Klippy info: {info}")
-        except Exception as e:
-            logging.warning(f"Failed to get machine id from Klipper: {e}")
 
     def _get_cpu_info(self) -> Dict[str, Any]:
         cpu_file = pathlib.Path("/proc/cpuinfo")
@@ -848,14 +950,13 @@ class Machine:
 
     async def update_usb_ids(self, force: bool = False) -> None:
         async with self.periph_lock:
-            db: MoonrakerDatabase = self.server.lookup_component("database")
             client: HttpClient = self.server.lookup_component("http_client")
             dpath = pathlib.Path(self.server.get_app_arg("data_path"))
             usb_ids_path = pathlib.Path(dpath).joinpath("misc/usb.ids")
             if usb_ids_path.is_file() and not force:
                 return
             usb_id_req_info: Dict[str, str]
-            usb_id_req_info = await db.get_item("moonraker", "usb_id_req_info", {})
+            usb_id_req_info = await self.database.get_item("moonraker", "usb_id_req_info", {})
             etag: Optional[str] = usb_id_req_info.pop("etag", None)
             last_modified: Optional[str] = usb_id_req_info.pop("last_modified", None)
             headers = {"Accept": "text/plain"}
@@ -878,7 +979,7 @@ class Machine:
                 usb_id_req_info["etag"] = resp.etag
             if resp.last_modified is not None:
                 usb_id_req_info["last_modifed"] = resp.last_modified
-            await db.insert_item("moonraker", "usb_id_req_info", usb_id_req_info)
+            await self.database.insert_item("moonraker", "usb_id_req_info", usb_id_req_info)
             # Write file
             logging.info("Writing usb.ids file...")
             eventloop = self.server.get_event_loop()
