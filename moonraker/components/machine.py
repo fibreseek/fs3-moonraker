@@ -102,7 +102,7 @@ class Machine:
         # Machine info parameters
         self._parameters: Dict[str, Any] = {}
         # Initialize machine_name with default value
-        self._parameters["machine_name"] = "fibre seek printer"
+        self._parameters["machine_name"] = "FibreSeeker 3"
         self._parameters["machine_id"] = self._gen_machine_id()
         self.system_info: Dict[str, Any] = {
             'python': {
@@ -252,7 +252,7 @@ class Machine:
 
     def get_machine_name(self) -> str:
         """Get the current machine name"""
-        return self._parameters.get("machine_name", "fibre seek printer")
+        return self._parameters.get("machine_name", "FibreSeeker 3")
 
     async def set_machine_name(self, new_value: str) -> None:
         """Set the machine name and persist it to database"""
@@ -281,7 +281,7 @@ class Machine:
     async def _load_parameters(self) -> None:
         """Load parameters from database"""
         try:
-            # Load machine_name from database, default to "fibre seek printer"
+            # Load machine_name from database, default to "FibreSeeker 3"
             machine_name = await self.database.get_item("fibretouch", "machine_name")
             logging.info(f"machine_name in batabase: {machine_name}")
             self._parameters["machine_name"] = machine_name
