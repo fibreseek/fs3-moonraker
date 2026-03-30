@@ -144,7 +144,7 @@ class MoonrakerTester:
             self.log(f"Bulk trigger command failed: {out}")
 
     def check_logs_for_notification(self, error_msg, start_time):
-        # We grep the log for "Error Indexer: 检测到错误" after our start time
+        # We grep the log for "Error Indexer: Error detected" after our start time
         # Since we can't easily filter by time with grep, we just look at the last N lines
         # and see if we find our message.
         
@@ -187,12 +187,12 @@ class MoonrakerTester:
         detected_count = 0
         failed_cases = []
         
-        # We look for "Error Indexer: 检测到错误 {code} - {msg}"
+        # We look for "Error Indexer: Error detected: {code} - {msg}"
         # We need to map back to our test cases?
         # Let's just check if we have enough detections.
         
         # Count detections
-        matches = re.findall(r"Error Indexer: 检测到错误 (\w+) -", output)
+        matches = re.findall(r"Error Indexer: Error detected: (\w+) -", output)
         detected_count = len(matches)
 
         # Identify missing cases by searching the error message part in new logs
