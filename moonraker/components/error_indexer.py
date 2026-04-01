@@ -5,22 +5,20 @@ import time
 from typing import Dict, Any, List, Optional, Tuple
 
 from ..confighelper import ConfigHelper
-from ..common import RequestType, WebRequest
+from ..common import WebRequest
 from ..utils import ServerError
 
 
 DB_NAMESPACE = "moonraker"
-DB_LANGUAGE_KEY = "error_indexer.language"
 WEBHOOK_ERROR_STATES = ("shutdown", "error")
 PLACEHOLDER_RE = re.compile(r"%(\d+)")
+DEFAULT_LANGUAGE = "en-US"
 
 
 class ErrorIndexer:
     def __init__(self, config: ConfigHelper) -> None:
         self.server = config.get_server()
         self.name = config.get_name()
-        # 获取数据库组件
-        self.database = self.server.lookup_component("database")
         # 获取 JSON-RPC 组件
         self.jsonrpc = self.server.lookup_component("jsonrpc")
         # 获取错误数据库文件路径
@@ -29,8 +27,8 @@ class ErrorIndexer:
         self.sheet_name = config.get("sheet_name", "klipper")
         # AI 错误单独使用 ai sheet，可通过配置覆盖
         self.ai_sheet_name = config.get("ai_sheet_name", "ai")
-        # 获取语言设置
-        self.language = config.get("language", "en-US")
+        # 语言设置默认为英文，将在 component_init 中从 fibretouch.language 读取
+        self.language = DEFAULT_LANGUAGE
         # 错误数据库
         self.error_db: Dict[str, Dict[str, Any]] = {}
         # AI 错误数据库（来自单独的 ai sheet）
@@ -80,13 +78,6 @@ class ErrorIndexer:
             "ai_detection:detection_result", self._handle_ai_detection_result
         )
 
-    # 注册 REST API 端点
-    def _register_endpoints(self) -> None:
-        self.server.register_endpoint(
-            "/server/error_indexer/config",
-            RequestType.POST,
-            self._handle_config_update,
-        )
 
     # 注册 WebSocket 通知
     def _register_notifications(self) -> None:
@@ -94,33 +85,49 @@ class ErrorIndexer:
 
     # 组件初始化
     async def component_init(self) -> None:
-        """组件初始化：从数据库恢复语言设置。"""
-        await self._load_persisted_language()
+        """组件初始化：订阅 fibretouch 设置并获取语言设置。"""
+        # 注册 printer:setting_changed 事件处理
+        self.server.register_event_handler(
+            "printer:setting_changed",
+            self._handle_printer_setting_changed
+        )
 
-    async def _load_persisted_language(self) -> None:
+        # 尝试从 printer_setting 组件获取当前语言设置
         try:
-            stored_lang = await self.database.get_item(
-                DB_NAMESPACE, DB_LANGUAGE_KEY, None
-            )
+            printer_setting = self.server.lookup_component("printer_setting")
+            # 直接访问 fibretouch 命名空间的设置缓存
+            if hasattr(printer_setting, '_setting_cache'):
+                fibretouch_settings = printer_setting._setting_cache.get("fibretouch", {})
+                language = fibretouch_settings.get("language")
+                if language:
+                    normalized = self._normalize_locale(language)
+                    if normalized:
+                        self.language = normalized
+                        logging.info("Error Indexer: Language setting from fibretouch: %s", self.language)
         except Exception as e:
-            logging.warning(
-                "Error Indexer: Failed to restore language setting, using current configured language (%s): %s",
+            logging.info(
+                "Error Indexer: Could not get language from printer_setting, using default %s: %s",
                 self.language, e
             )
+
+    def _handle_printer_setting_changed(self, changes: Dict[str, Dict[str, Any]]) -> None:
+        """处理 printer:setting_changed 事件，更新语言设置。"""
+        if not isinstance(changes, dict):
             return
-        if isinstance(stored_lang, str) and stored_lang:
-            self.language = stored_lang
-            logging.info("Error Indexer: Restored language setting from database: %s", self.language)
 
-    # 持久化语言设置
-    async def _persist_language(self) -> None:
-        try:
-            await self.database.insert_item(DB_NAMESPACE, DB_LANGUAGE_KEY, self.language)
-        except Exception as e:
-            logging.warning(
-                "Error Indexer: Failed to persist language setting (%s): %s",
-                self.language, e
-            )
+        # 检查 fibretouch 命名空间的 language 字段
+        fibretouch_changes = changes.get("fibretouch", {})
+        if isinstance(fibretouch_changes, dict) and "language" in fibretouch_changes:
+            new_language = fibretouch_changes["language"]
+            if new_language:
+                normalized = self._normalize_locale(new_language)
+                if normalized and normalized != self.language:
+                    old_language = self.language
+                    self.language = normalized
+                    logging.info(
+                        "Error Indexer: Language changed from %s to %s",
+                        old_language, self.language
+                    )
 
     def _hook_gcode_api(self) -> None:
         """Hook printer.gcode.script API to capture error responses."""
@@ -585,22 +592,6 @@ class ErrorIndexer:
         if sol_multi.get("en-US", ""):
             return sol_multi["en-US"]
         return next((v for v in sol_multi.values() if v), "")
-
-    async def _handle_config_update(self, web_request: WebRequest) -> Dict[str, Any]:
-        """POST 更新语言等配置。"""
-        lang = web_request.get_str("language", None)
-        if lang:
-            normalized = self._normalize_locale(lang)
-            if not normalized:
-                raise self.server.error(
-                    "Invalid language. Expected ISO 639-1 + ISO 3166-1, e.g. 'zh-CN' or 'en-US'.",
-                    400,
-                )
-            self.language = normalized
-            logging.info("Error Indexer: Language changed to %s", self.language)
-            await self._persist_language()
-            
-        return {"language": self.language}
 
 def load_component(config: ConfigHelper) -> ErrorIndexer:
     return ErrorIndexer(config)
