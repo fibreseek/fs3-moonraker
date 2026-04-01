@@ -203,6 +203,28 @@ class DetectionParams:
         }
 
 
+# 上位机三档灵敏度：对应下发给 AI 服务的 obj_thresh（置信度门槛）
+SENSITIVITY_OBJ_THRESH: Dict[str, float] = {
+    "high": 0.5,
+    "medium": 0.65,
+    "low": 0.8,
+}
+
+_SENSITIVITY_LABEL_TO_KEY: Dict[str, str] = {
+    "high": "high",
+    "medium": "medium",
+    "low": "low",
+}
+
+
+def _canonical_sensitivity_key(value: str) -> str:
+    """将 API 档位标签规范为 high|medium|low（英文，大小写不敏感）。非法则抛 ValueError。"""
+    key = value.strip().lower()
+    if key in _SENSITIVITY_LABEL_TO_KEY:
+        return _SENSITIVITY_LABEL_TO_KEY[key]
+    raise ValueError(f"invalid sensitivity label: {value!r}")
+
+
 @dataclass
 class DefectDetectionResult:
     """缺陷检测结果数据类
@@ -430,6 +452,8 @@ class AIDetectionClient:
         self.nms_thresh: float = config.getfloat(
             "default_nms_thresh", 0.45, minval=0.0, maxval=1.0
         )
+        # 三档灵敏度（high/medium/low）；None 表示走 default_obj_thresh / 数值调参流程
+        self.sensitivity: Optional[str] = None
 
         # 连接状态
         self._state: ConnectionState = ConnectionState.DISCONNECTED # 初始状态
@@ -512,6 +536,23 @@ class AIDetectionClient:
         self._request_counter += 1
         timestamp = int(time.time() * 1000)
         return f"{detection_type.value}_{self._request_counter}_{timestamp}"
+
+    def _effective_obj_thresh(self, override: Optional[float]) -> float:
+        """显式参数 > 灵敏度档位 > self.obj_thresh"""
+        if override is not None:
+            return float(override)
+        if self.sensitivity is not None:
+            return SENSITIVITY_OBJ_THRESH[self.sensitivity]
+        return self.obj_thresh
+
+    def _config_notification_payload(self) -> Dict[str, Any]:
+        return {
+            **self.coordinator_config.to_dict(),
+            "obj_thresh": self.obj_thresh,
+            "nms_thresh": self.nms_thresh,
+            "sensitivity": self.sensitivity,
+            "effective_obj_thresh": self._effective_obj_thresh(None),
+        }
 
     async def component_init(self) -> None:
         """组件初始化，在 Moonraker 启动后调用"""
@@ -830,7 +871,7 @@ class AIDetectionClient:
             return DefectDetectionResult(is_valid=False, warning=False)
 
         params = DetectionParams(
-            obj_thresh=obj_thresh if obj_thresh is not None else self.obj_thresh,
+            obj_thresh=self._effective_obj_thresh(obj_thresh),
             nms_thresh=nms_thresh if nms_thresh is not None else self.nms_thresh,
             is_lite=is_lite
         )
@@ -879,7 +920,7 @@ class AIDetectionClient:
             return "ok"
 
         params = DetectionParams(
-            obj_thresh=obj_thresh if obj_thresh is not None else self.obj_thresh,
+            obj_thresh=self._effective_obj_thresh(obj_thresh),
             nms_thresh=nms_thresh if nms_thresh is not None else self.nms_thresh
         )
 
@@ -1003,6 +1044,8 @@ class AIDetectionClient:
                 # AI检测配置
                 "obj_thresh": self.obj_thresh,
                 "nms_thresh": self.nms_thresh,
+                "sensitivity": self.sensitivity,
+                "effective_obj_thresh": self._effective_obj_thresh(None),
                 # 协调器配置
                 "enable": self.coordinator_config.enable,
                 "enable_foreign_detect": self.coordinator_config.enable_foreign_detect,
@@ -1040,6 +1083,7 @@ class AIDetectionClient:
         - auto_pause_on_spaghetti: 意面效应时自动暂停
         - auto_pause_on_zits: 疙瘩时自动暂停
         - auto_pause_on_stringing: 拉丝时自动暂停
+        - sensitivity: 三档灵敏度 high|medium|low（英文，大小写不敏感）；null 清除并恢复数值阈值模式
         """
         params = web_request.get_args() or {}
 
@@ -1053,6 +1097,7 @@ class AIDetectionClient:
         updated = False
         coordinator_updated = False  # 标记 coordinator 配置是否更新
         thresh_updates: Dict[str, Any] = {}  # 阈值更新字典，用于持久化
+        sensitivity_in_request = False
 
         def _validate_thresh(name: str, value: Any) -> float:
             if not isinstance(value, (int, float)):
@@ -1063,6 +1108,14 @@ class AIDetectionClient:
             return val
 
         if "obj_thresh" in params:
+            # 显式数值阈值优先：退出灵敏度档位模式
+            self.sensitivity = None
+            try:
+                await self.database.delete_item(
+                    "ai_detection", "default_sensitivity"
+                )
+            except Exception:
+                pass
             self.obj_thresh = _validate_thresh("obj_thresh", params["obj_thresh"])
             result["obj_thresh"] = self.obj_thresh
             thresh_updates["default_obj_thresh"] = self.obj_thresh
@@ -1072,6 +1125,34 @@ class AIDetectionClient:
             self.nms_thresh = _validate_thresh("nms_thresh", params["nms_thresh"])
             result["nms_thresh"] = self.nms_thresh
             thresh_updates["default_nms_thresh"] = self.nms_thresh
+            updated = True
+
+        if "sensitivity" in params and "obj_thresh" not in params:
+            sensitivity_in_request = True
+            sraw = params["sensitivity"]
+            if sraw is None:
+                self.sensitivity = None
+                try:
+                    await self.database.delete_item(
+                        "ai_detection", "default_sensitivity"
+                    )
+                except Exception:
+                    pass
+            else:
+                if not isinstance(sraw, str):
+                    raise self.server.error(
+                        "sensitivity must be a string or null", 400
+                    )
+                try:
+                    canon = _canonical_sensitivity_key(sraw)
+                except ValueError:
+                    raise self.server.error(
+                        "sensitivity must be high, medium, or low", 400
+                    )
+                self.sensitivity = canon
+                await self.database.insert_item(
+                    "ai_detection", "default_sensitivity", canon
+                )
             updated = True
 
         # 处理 coordinator 配置
@@ -1097,20 +1178,19 @@ class AIDetectionClient:
         if not updated:
             raise self.server.error("No valid configuration parameters provided", 400)
 
-        # 如果只更新了检测阈值（obj_thresh, nms_thresh），需要持久化并发送配置更新通知
-        if updated and not coordinator_updated and thresh_updates:
-            # 持久化阈值配置
+        result["sensitivity"] = self.sensitivity
+        result["effective_obj_thresh"] = self._effective_obj_thresh(None)
+
+        if updated and thresh_updates:
             await self._persist_config(thresh_updates)
 
-            # 构建完整的配置字典发送通知
-            config_notification = {
-                **self.coordinator_config.to_dict(),
-                "obj_thresh": self.obj_thresh,
-                "nms_thresh": self.nms_thresh,
-            }
+        # 未改协调器时由本处发通知；协调器更新时由 _update_coordinator_config 发送（含灵敏度字段）
+        if updated and not coordinator_updated and (
+            thresh_updates or sensitivity_in_request
+        ):
             self.server.send_event(
                 "ai_detection:config_updated",
-                config_notification
+                self._config_notification_payload(),
             )
 
         return result
@@ -1130,6 +1210,19 @@ class AIDetectionClient:
             )
             if db_nms_thresh is not None:
                 self.nms_thresh = float(db_nms_thresh)
+
+            db_sensitivity = await self.database.get_item(
+                "ai_detection", "default_sensitivity", None
+            )
+            if db_sensitivity is not None:
+                try:
+                    self.sensitivity = _canonical_sensitivity_key(str(db_sensitivity))
+                except ValueError:
+                    logging.warning(
+                        "AI Detection: invalid default_sensitivity in DB, ignoring: %r",
+                        db_sensitivity,
+                    )
+                    self.sensitivity = None
 
             # 加载协调器配置
             db_coordinator_config = await self.database.get_item(
@@ -1158,6 +1251,15 @@ class AIDetectionClient:
                     self.database.insert_item("ai_detection", "default_obj_thresh", value)
                 elif key == "default_nms_thresh":
                     self.database.insert_item("ai_detection", "default_nms_thresh", value)
+                elif key == "default_sensitivity":
+                    if value is None:
+                        self.database.delete_item(
+                            "ai_detection", "default_sensitivity"
+                        )
+                    else:
+                        self.database.insert_item(
+                            "ai_detection", "default_sensitivity", value
+                        )
                 elif key in [
                     "enable",
                     "enable_foreign_detect",
@@ -1252,14 +1354,9 @@ class AIDetectionClient:
         self.eventloop.create_task(self._persist_config(updates))
 
         # 发送配置更新通知（包含所有配置）
-        config_notification = {
-            **self.coordinator_config.to_dict(),
-            "obj_thresh": self.obj_thresh,
-            "nms_thresh": self.nms_thresh,
-        }
         self.server.send_event(
             "ai_detection:config_updated",
-            config_notification
+            self._config_notification_payload(),
         )
 
         # 如果 enable 从 false 变为 true，检查是否需要启动定时检测

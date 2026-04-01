@@ -87,6 +87,8 @@ foreign_class_2: hand, Hand detected
 
 > **提示**: 用户可通过 `skip_foreign_detect=true` 参数跳过异物检测，直接启动打印。适用于已确认平台清洁的场景。
 
+> **状态字段**: `config.sensitivity` 为档位模式时取 `high` / `medium` / `low`，否则为 `null`。`config.effective_obj_thresh` 为当前实际用于检测的置信度门槛（与 `obj_thresh` 在档位模式下可能不同）。
+
 ---
 
 ## 详细配置说明
@@ -120,6 +122,23 @@ foreign_class_2: hand, Hand detected
 | `foreign_class_<id>` | 平台异物类别映射 | - | 格式: `name, description` |
 
 > **提示**: `default_obj_thresh` 值越小检测越灵敏，但可能产生误报；值越大越严格，但可能漏检。建议根据实际效果调整。
+
+### 三档灵敏度（上位机 API，可选）
+
+上位机可通过 **`POST /server/ai_detection/config`**（或 JSON-RPC `server.ai_detection.config`）设置 **`sensitivity`**，用固定档位映射到下发给 AI 服务的 **`obj_thresh`**（检测置信度门槛）。未设置档位时（`sensitivity` 为 `null` / 从未写入数据库），行为与原先一致：使用配置文件中的 `default_obj_thresh`、数据库中的 `default_obj_thresh`，以及 API 传入的 `obj_thresh` 数值。
+
+| 档位（API 取值） | 含义（置信度门槛） | 实际 `obj_thresh` |
+|------------------|-------------------|-------------------|
+| `high` | 置信度 &gt; 50% | `0.5` |
+| `medium` | 置信度 &gt; 65% | `0.65` |
+| `low` | 置信度 &gt; 80% | `0.8` |
+
+API 只接受英文枚举（大小写不敏感），例如 `high`、`Medium`、`LOW`。
+
+- **有效检测阈值** `effective_obj_thresh`：Moonraker 向 AI 服务下发请求时，内部若显式传入 `obj_thresh` 则使用该值；否则已设档位时用表中映射；否则用 `obj_thresh`（配置 / 数据库数值）。
+-  **`nms_thresh`** 不受档位影响，仍单独配置。
+-  **`sensitivity: null`**：清除档位，恢复纯数值阈值模式；数据库键 `default_sensitivity` 会被删除。
+-  同一次请求中若包含 **`obj_thresh`**：**以数值为准**，并自动清除档位（避免两种模式并存）。
 
 ### 自动暂停配置
 
@@ -207,7 +226,17 @@ foreign_class_3: tool, Tool on bed        # 新增类别
         "request_timeout": 30.0,
         "auto_connect": true,
         "obj_thresh": 0.35,
-        "nms_thresh": 0.45
+        "nms_thresh": 0.45,
+        "sensitivity": null,
+        "effective_obj_thresh": 0.35,
+        "enable": true,
+        "enable_foreign_detect": true,
+        "enable_defect_detect": true,
+        "detect_interval": 10.0,
+        "auto_pause_on_defect": true,
+        "auto_pause_on_spaghetti": true,
+        "auto_pause_on_zits": false,
+        "auto_pause_on_stringing": false
     },
     "class_mappings": {
         "defect_classes": {
@@ -221,19 +250,7 @@ foreign_class_3: tool, Tool on bed        # 新增类别
             "2": {"name": "hand", "description": "Hand detected"}
         }
     },
-    "coordinator": {
-        "config": {
-            "enable": true,
-            "enable_foreign_detect": true,
-            "enable_defect_detect": true,
-            "detect_interval": 10.0,
-            "auto_pause_on_defect": true,
-            "auto_pause_on_spaghetti": true,
-            "auto_pause_on_zits": false,
-            "auto_pause_on_stringing": false
-        },
-        "is_detecting": false
-    }
+    "is_detecting": false
 }
 ```
 
@@ -260,8 +277,9 @@ foreign_class_3: tool, Tool on bed        # 新增类别
 
 **支持的配置项**:
 - `enable`: AI 总开关（控制所有 AI 功能）
-- `obj_thresh`: 检测灵敏度 (0.0-1.0)
+- `obj_thresh`: 检测灵敏度 (0.0-1.0)，与 `sensitivity` 同次请求时会清除档位
 - `nms_thresh`: 重复过滤阈值 (0.0-1.0)
+- `sensitivity`: 三档灵敏度，字符串 `high` | `medium` | `low`（英文，大小写不敏感）；`null` 清除档位。若请求中带有 `obj_thresh`，则忽略本字段（以数值模式为准）
 - `enable_foreign_detect`: 是否启用异物检测
 - `enable_defect_detect`: 是否启用缺陷检测
 - `detect_interval`: 检测间隔（秒，最小值 1.0）
@@ -276,6 +294,8 @@ foreign_class_3: tool, Tool on bed        # 新增类别
     "enable": true,
     "obj_thresh": 0.4,
     "nms_thresh": 0.45,
+    "sensitivity": null,
+    "effective_obj_thresh": 0.4,
     "enable_foreign_detect": true,
     "enable_defect_detect": true,
     "detect_interval": 15.0,
@@ -286,13 +306,28 @@ foreign_class_3: tool, Tool on bed        # 新增类别
 }
 ```
 
+**仅切换档位示例**:
+```json
+{
+    "jsonrpc": "2.0",
+    "method": "server.ai_detection.config",
+    "params": {
+        "sensitivity": "high"
+    },
+    "id": 3
+}
+```
+
+此时返回中的 `effective_obj_thresh` 为 `0.5`，`sensitivity` 为 `"high"`。
+
 **使用场景**:
-- 误报太多 → 增大 `obj_thresh` 到 0.4-0.5
-- 漏检严重 → 减小 `obj_thresh` 到 0.25-0.3
+- 误报太多 → 增大 `obj_thresh` 到 0.4-0.5，或使用档位 `low`（门槛 0.8）
+- 漏检严重 → 减小 `obj_thresh` 到 0.25-0.3，或使用档位 `high`（门槛 0.5）
 - 临时禁用 AI → 设置 `enable: false`
 - 调整检测频率 → 修改 `detect_interval`
+- 用 UI 三档控制灵敏度 → 设置 `sensitivity`，无需计算具体浮点数
 
-> **配置持久化**: 通过此 API 更新的配置会自动保存到 Moonraker 数据库，重启后配置仍然生效。配置文件中的值作为默认值，数据库中的值会覆盖配置文件的值。
+> **配置持久化**: 通过此 API 更新的配置会自动保存到 Moonraker 数据库，重启后配置仍然生效。配置文件中的值作为默认值，数据库中的 `default_obj_thresh` / `default_nms_thresh` / **`default_sensitivity`** 会覆盖对应项；未写入过 `sensitivity` 时仍只受 `default_obj_thresh` 等影响。
 
 ---
 
@@ -406,7 +441,9 @@ foreign_class_3: tool, Tool on bed        # 新增类别
         "auto_pause_on_zits": false,
         "auto_pause_on_stringing": false,
         "obj_thresh": 0.4,
-        "nms_thresh": 0.45
+        "nms_thresh": 0.45,
+        "sensitivity": "medium",
+        "effective_obj_thresh": 0.65
     }]
 }
 ```
@@ -422,8 +459,10 @@ foreign_class_3: tool, Tool on bed        # 新增类别
 | `auto_pause_on_spaghetti` | boolean | 意面效应自动暂停 |
 | `auto_pause_on_zits` | boolean | 疙瘩自动暂停 |
 | `auto_pause_on_stringing` | boolean | 拉丝自动暂停 |
-| `obj_thresh` | number | 检测阈值 (0.0-1.0) |
+| `obj_thresh` | number | 存储的数值检测阈值 (0.0-1.0)；档位模式下仍为底层配置值 |
 | `nms_thresh` | number | NMS阈值 (0.0-1.0) |
+| `sensitivity` | string \| null | 档位：`high` / `medium` / `low`，未启用档位时为 `null` |
+| `effective_obj_thresh` | number | 当前实际用于下发 AI 服务的检测阈值 |
 
 **用途**: 上位机可以实时同步配置状态到 UI，多个客户端之间保持配置一致，避免轮询状态接口。
 
@@ -467,6 +506,8 @@ AI 检测模块采用单一组件架构设计：
 | 400 | No configuration parameters provided | 没有有效的配置参数 | 检查参数名称 |
 | 400 | `<name>` must be a number | 参数类型错误 | 确保数字类型 |
 | 400 | `<name>` must be between 0.0 and 1.0 | 参数超出范围 | 检查数值范围 |
+| 400 | `sensitivity must be high, medium, or low` | 档位字符串非法 | 使用 `high` / `medium` / `low`（英文），或 `null` |
+| 400 | `sensitivity must be a string or null` | 档位类型错误 | 传字符串或 JSON `null` |
 | 403 | Foreign object detected, please confirm before printing | 检测到异物 | 清理平台后重试，或使用 `skip_foreign_detect=true` 强制启动 |
 | 503 | AI Detection client not available | 协调器未初始化 | 检查配置 |
 | 503 | AI Detection connection closed | 连接丢失 | 检查 AI 服务器是否运行 |
@@ -501,8 +542,9 @@ moonraker.on("notify_ai_detection_detection_result", (data) => {
 ### 3. 动态调整配置
 
 根据实际效果调整检测灵敏度：
-- 误报太多 → 增大 `obj_thresh` 到 0.4-0.5
-- 漏检严重 → 减小 `obj_thresh` 到 0.25-0.3
+- 误报太多 → 增大 `obj_thresh` 到 0.4-0.5，或设 `sensitivity: "low"`
+- 漏检严重 → 减小 `obj_thresh` 到 0.25-0.3，或设 `sensitivity: "high"`
+- 需要与 UI 三档控件对齐 → 使用 `sensitivity`，并订阅 `notify_ai_detection_config_updated` 中的 `effective_obj_thresh`
 
 ---
 
