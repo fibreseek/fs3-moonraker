@@ -8,8 +8,7 @@
 - **实时错误检测**：监控以 "!!" 开头的标准错误及 webhooks 状态消息。
 - **错误索引系统**：基于 xlsx 文件（含占位符 %1、%2…）提供多语言描述与解决方案。
 - **通知推送**：检测到错误时通过 WebSocket 推送 `error_indexer:error_detected`，含错误码、描述、解决方案链接。
-- **多语言支持**：支持动态切换语言（ISO 639-1 + ISO 3166-1，如 zh-CN、en-US），语言设置会持久化。
-- **REST API**：提供 `POST /server/error_indexer/config` 更新语言等配置。
+- **多语言支持**：支持多语言错误描述（ISO 639-1 + ISO 3166-1，如 zh-CN、en-US），语言设置从 `fibretouch.language` 动态获取。
 
 **依赖**：需安装 `openpyxl` 以读取 xlsx（如 `pip install openpyxl`）。
 
@@ -39,7 +38,7 @@
 | `file_path` | 同 xlsx 路径，与 `xlsx_path` 二选一 | 同上 |
 | `csv_path` | 兼容旧配置的路径键，优先级低于上述两项 | 同上 |
 | `sheet_name` | xlsx 内要读取的表格名称 | `klipper` |
-| `language` | 默认界面语言（如 en-US、zh-CN） | `en-US` |
+| `ai_sheet_name` | AI 错误的表格名称 | `ai` |
 
 **示例**：
 
@@ -47,14 +46,12 @@
 [error_indexer]
 xlsx_path: /home/pi/printer_data/config/error_info.xlsx
 sheet_name: klipper
-language: en-US
 ```
 
 仅使用默认路径时也可只写：
 
 ```ini
 [error_indexer]
-language: zh-CN
 ```
 
 配置完成后重启 Moonraker 使插件生效。
@@ -91,26 +88,41 @@ ja-JP：右ノズルのオフセットキャリブレーションに失敗しま
 
 ---
 
-## 4. WebSocket (JSON-RPC) 接口
+## 4. 语言设置
 
-### 4.1 更新配置
+### 4.1 设置语言
 
-- **HTTP**：`POST /server/error_indexer/config`
-- **WebSocket Method**：`server.error_indexer.config`
-- **Params**：
-  - `language`：目标语言，须为 xx-XX（如 `zh-CN`、`en-US`）。
-- **返回**：`{"language": "zh-CN"}` 等当前语言。
+本插件从 `fibretouch.language` 动态获取语言设置，默认为 `en-US`。
 
-示例：
+**通过 printer_setting API 设置语言**：
 
 ```json
 {
   "jsonrpc": "2.0",
-  "method": "server.error_indexer.config",
-  "params": {"language": "zh-CN"},
+  "method": "printer.set_setting",
+  "params": {
+    "fibretouch": {
+      "language": "zh-CN"
+    }
+  },
+  "id": 1
+}
+```
+
+**订阅语言变化通知**：
+
+```json
+{
+  "jsonrpc": "2.0",
+  "method": "printer.subscribe_setting",
+  "params": {
+    "fibretouch": []
+  },
   "id": 2
 }
 ```
+
+语言变化时会收到 `notify_printer_setting_changed` 通知。
 
 ---
 
