@@ -42,8 +42,6 @@ class ErrorIndexer:
         )
         # 注册事件处理程序
         self._register_handlers()
-        # 注册 REST API 端点
-        self._register_endpoints()
         # 注册 WebSocket 通知
         self._register_notifications()
         # 挂钩 printer.gcode.script API
@@ -85,40 +83,40 @@ class ErrorIndexer:
 
     # 组件初始化
     async def component_init(self) -> None:
-        """组件初始化：订阅 fibretouch 设置并获取语言设置。"""
-        # 注册 printer:setting_changed 事件处理
+        """组件初始化：订阅 database:data_changed 事件并获取当前语言设置。"""
+        # 注册 database:data_changed 事件处理，监听 fibretouch.language 变化
         self.server.register_event_handler(
-            "printer:setting_changed",
-            self._handle_printer_setting_changed
+            "database:data_changed",
+            self._handle_database_data_changed
         )
 
-        # 尝试从 printer_setting 组件获取当前语言设置
+        # 从数据库获取当前语言设置
         try:
-            printer_setting = self.server.lookup_component("printer_setting")
-            # 直接访问 fibretouch 命名空间的设置缓存
-            if hasattr(printer_setting, '_setting_cache'):
-                fibretouch_settings = printer_setting._setting_cache.get("fibretouch", {})
-                language = fibretouch_settings.get("language")
+            database = self.server.lookup_component("database", None)
+            if database:
+                language = await database.get_item("fibretouch", "language", None)
                 if language:
                     normalized = self._normalize_locale(language)
                     if normalized:
                         self.language = normalized
-                        logging.info("Error Indexer: Language setting from fibretouch: %s", self.language)
+                        logging.info("Error Indexer: Initial language setting from database: %s", self.language)
         except Exception as e:
-            logging.info(
-                "Error Indexer: Could not get language from printer_setting, using default %s: %s",
+            logging.warning(
+                "Error Indexer: Failed to get initial language from database, using default %s: %s",
                 self.language, e
             )
 
-    def _handle_printer_setting_changed(self, changes: Dict[str, Dict[str, Any]]) -> None:
-        """处理 printer:setting_changed 事件，更新语言设置。"""
-        if not isinstance(changes, dict):
+    def _handle_database_data_changed(self, event_data: Dict[str, Any]) -> None:
+        """处理 database:data_changed 事件，更新语言设置。"""
+        if not isinstance(event_data, dict):
             return
 
-        # 检查 fibretouch 命名空间的 language 字段
-        fibretouch_changes = changes.get("fibretouch", {})
-        if isinstance(fibretouch_changes, dict) and "language" in fibretouch_changes:
-            new_language = fibretouch_changes["language"]
+        # 检查是否是 fibretouch 命名空间的 language 字段变化
+        namespace = event_data.get("namespace")
+        records = event_data.get("records")
+
+        if namespace == "fibretouch" and isinstance(records, dict) and "language" in records:
+            new_language = records["language"]
             if new_language:
                 normalized = self._normalize_locale(new_language)
                 if normalized and normalized != self.language:
@@ -557,9 +555,9 @@ class ErrorIndexer:
             "solution_link": solution,
             "original_response": original_response
         }
-        
+
         self.server.send_event("error_indexer:error_detected", payload)
-        logging.info(f"Error Indexer: Error detected: {code} - {error_msg}")
+        logging.info(f"Error Indexer: Error detected and notification sent: {code} - {error_msg}")
 
     def _get_description(
         self,
