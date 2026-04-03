@@ -213,7 +213,9 @@ class KlippyAPI(APITransport):
         except Exception as e:
             logging.warning(f"Failed to predict job_id: {e}")
 
+        # 初始化变量，确保即使没有元数据也有默认值
         print_mode: int = -1
+        chamber_temp: float = 0.0
         if metadata:
             logging.info(f"Processing print parameters from metadata for file: {filename}")
             
