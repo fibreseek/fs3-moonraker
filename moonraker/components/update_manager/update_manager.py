@@ -60,6 +60,7 @@ def get_deploy_class(
         AppType.WEB: NetDeploy,
         AppType.GIT_REPO: GitDeploy,
         AppType.ZIP: NetDeploy,
+        AppType.OTA_ZIP: NetDeploy,
         AppType.PYTHON: PythonDeploy,
         AppType.EXECUTABLE: NetDeploy
     }

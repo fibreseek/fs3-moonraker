@@ -10,6 +10,7 @@ import shutil
 import zipfile
 import logging
 import stat
+import urllib.parse
 from .app_deploy import AppDeploy
 from .common import Channel, AppType
 from ...utils import source_info
@@ -34,7 +35,8 @@ class NetDeploy(AppDeploy):
     def __init__(self, config: ConfigHelper) -> None:
         super().__init__(config, "Zip Application")
         self._configure_path(config, False)
-        if self.type == AppType.ZIP:
+        logging.info(f"App type: {self.type}")
+        if self.type in (AppType.ZIP, AppType.OTA_ZIP):
             self._configure_virtualenv(config)
             self._configure_dependencies(config)
             self._configure_managed_services(config)
@@ -46,6 +48,19 @@ class NetDeploy(AppDeploy):
             self._configure_managed_services(config)
         self.repo = config.get('repo').strip().strip("/")
         self.owner, self.project_name = self.repo.split("/", 1)
+        self.ota_manifest_url: Optional[str] = None
+        if self.type == AppType.OTA_ZIP:
+            self.ota_manifest_url = config.get("ota_manifest_url", None)
+            if not self.ota_manifest_url:
+                raise config.error(
+                    f"[{config.get_name()}]: option 'ota_manifest_url' is required "
+                    "when type is ota_zip"
+                )
+        elif config.has_option("ota_manifest_url"):
+            raise config.error(
+                f"[{config.get_name()}]: option 'ota_manifest_url' is only valid when "
+                "type is ota_zip"
+            )
         self.asset_name: Optional[str] = None
         self.persistent_files: List[str] = []
         self.warnings: List[str] = []
@@ -61,6 +76,10 @@ class NetDeploy(AppDeploy):
         self._path_writable: bool = False
         self._configure_persistent_files(config)
         self.is_gitee = config.getboolean('is_gitee', False)
+        if self.type == AppType.OTA_ZIP and self.is_gitee:
+            raise config.error(
+                f"[{config.get_name()}]: 'is_gitee' is not applicable to type ota_zip"
+            )
         self.body_message: Optional[str] = None
 
     def _configure_persistent_files(self, config: ConfigHelper) -> None:
@@ -78,7 +97,7 @@ class NetDeploy(AppDeploy):
                         f"'{fname}' can not be persistent."
                     )
         if (
-            self.type == AppType.ZIP and
+            self.type in (AppType.ZIP, AppType.OTA_ZIP) and
             self.virtualenv is not None and
             self.virtualenv in self.path.parents
         ):
@@ -289,8 +308,85 @@ class NetDeploy(AppDeploy):
             result = release
         self.last_error = ""
         return result
+    
+    async def _format_ota_release_notes(self, data: Dict[str, Any]) -> str:
+        rn = data.get("release_note")
+        if isinstance(rn, dict):
+            database = self.server.lookup_component("database", None)
+            language = await database.get_item("fibretouch", "language", "en-US")
+            logging.info(f"Language: {language}")
+            return rn.get(language, "")
+        if isinstance(rn, str):
+            return rn
+        return ""
+
+    def _ota_staged_download_name(self, dl_url: str) -> str:
+        path = urllib.parse.urlparse(dl_url).path
+        name = pathlib.Path(path).name
+        if name:
+            return name
+        return f"{self.name}.fibrepack"
+
+    @staticmethod
+    def _extract_ota_download_url(data: Dict[str, Any]) -> Optional[str]:
+        # Support both release_info style and platform config style keys.
+        for key in ("download_url", "downloadUrl", "url", "update-url"):
+            val = data.get(key)
+            if isinstance(val, str) and val.strip():
+                return val.strip()
+        return None
+
+    async def _get_remote_version_ota(self) -> None:
+        assert self.ota_manifest_url is not None
+        client = self.cmd_helper.get_http_client()
+        resp = await client.request(
+            "GET",
+            self.ota_manifest_url,
+            enable_cache=False,
+            attempts=3,
+            retry_pause_time=.5,
+            request_timeout=30.,
+        )
+        if resp.has_error() or resp.status_code >= 400:
+            err = resp.error or f"HTTP {resp.status_code}"
+            self.log_info(f"OTA manifest request failed: {err}")
+            self.last_error = str(err)
+            return
+        try:
+            data: Dict[str, Any] = resp.json()
+        except Exception:
+            logging.exception("Failed to parse OTA manifest JSON")
+            self.last_error = "Invalid OTA manifest JSON"
+            return
+        logging.info(f"OTA manifest data: {data}")
+        remote_ver = data.get("version")
+        dl_url = self._extract_ota_download_url(data)
+        if not remote_ver or not dl_url:
+            self.last_error = (
+                "OTA manifest missing 'version' or download url "
+                "(download_url/update-url)"
+            )
+            self.log_info(self.last_error)
+            return
+        # update-url may be a directory entry in platform config manifests.
+        if dl_url.endswith("/"):
+            self.last_error = (
+                "OTA manifest provides a directory update-url, expected direct "
+                "package URL (e.g. *.fibrepack)"
+            )
+            self.log_info(self.last_error)
+            return
+        self.remote_version = str(remote_ver)
+        self.body_message = await self._format_ota_release_notes(data)
+        self.dl_info = (str(dl_url), "application/octet-stream", -1)
+        self.last_error = ""
+        self._is_prerelease = False
 
     async def _get_remote_version(self) -> None:
+        logging.info(f"App type: {self.type}")
+        if self.type == AppType.OTA_ZIP:
+            await self._get_remote_version_ota()
+            return
         result = await self._fetch_github_version()
         if not result:
             return
@@ -458,29 +554,47 @@ class NetDeploy(AppDeploy):
         self.notify_status(start_msg)
         self.notify_status("Downloading Release...")
         dep_info: Optional[Dict[str, Any]] = None
-        if self.type in (AppType.ZIP, AppType.EXECUTABLE):
+        if self.type in (AppType.ZIP, AppType.OTA_ZIP, AppType.EXECUTABLE):
             dep_info = await self._collect_dependency_info()
         td = await self.cmd_helper.create_tempdir(self.name, "app")
         try:
             tempdir = pathlib.Path(td.name)
-            if self.asset_name is not None:
-                temp_download_file = tempdir.joinpath(self.asset_name)
-            else:
-                temp_download_file = tempdir.joinpath(f"{self.name}.zip")
             temp_persist_dir = tempdir.joinpath(self.name)
             client = self.cmd_helper.get_http_client()
-            await client.download_file(
-                dl_url, content_type, temp_download_file, size,
-                self.cmd_helper.on_download_progress
-            )
+            if self.type == AppType.OTA_ZIP:
+                staged = tempdir.joinpath(self._ota_staged_download_name(dl_url))
+                await client.download_file(
+                    dl_url,
+                    content_type or "application/octet-stream",
+                    staged,
+                    size,
+                    self.cmd_helper.on_download_progress,
+                )
+                zip_path = tempdir.joinpath(f"{self.name}.zip")
+                await event_loop.run_in_thread(
+                    shutil.move, str(staged), str(zip_path)
+                )
+                extract_file = zip_path
+            elif self.asset_name is not None:
+                extract_file = tempdir.joinpath(self.asset_name)
+                await client.download_file(
+                    dl_url, content_type, extract_file, size,
+                    self.cmd_helper.on_download_progress
+                )
+            else:
+                extract_file = tempdir.joinpath(f"{self.name}.zip")
+                await client.download_file(
+                    dl_url, content_type, extract_file, size,
+                    self.cmd_helper.on_download_progress
+                )
             self.notify_status(
                 f"Download Complete, extracting release to '{self.path}'"
             )
             if self.type == AppType.EXECUTABLE:
-                await self._finalize_executable(temp_download_file, new_ver)
+                await self._finalize_executable(extract_file, new_ver)
             else:
                 await event_loop.run_in_thread(
-                    self._extract_release, temp_persist_dir, temp_download_file
+                    self._extract_release, temp_persist_dir, extract_file
                 )
         finally:
             await event_loop.run_in_thread(td.cleanup)
@@ -504,6 +618,11 @@ class NetDeploy(AppDeploy):
         await self.update(self.dl_info, True, force_dep_update)
 
     async def rollback(self) -> bool:
+        if self.type == AppType.OTA_ZIP:
+            raise self.server.error(
+                f"{self.prefix}Rollback is not supported for ota_zip deployments",
+                False,
+            )
         if self.rollback_version == "?" or self.rollback_repo == "?":
             raise self.server.error("Incomplete Rollback Data", False)
         if self.rollback_version == self.version:
