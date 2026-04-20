@@ -309,89 +309,54 @@ class NetDeploy(AppDeploy):
         self.last_error = ""
         return result
     
-    async def _format_ota_release_notes(self, data: Dict[str, Any]) -> str:
+    @staticmethod
+    def _format_ota_release_notes(
+        data: Dict[str, Any], language: Optional[str] = None
+    ) -> str:
         rn = data.get("release_note")
         if isinstance(rn, dict):
-            database = self.server.lookup_component("database", None)
-            language = await database.get_item("fibretouch", "language", "en-US")
-            logging.info(f"Language: {language}")
-            return rn.get(language, "")
-        if isinstance(rn, str):
-            return rn
-        return ""
-
-    def _ota_staged_download_name(self, dl_url: str) -> str:
-        path = urllib.parse.urlparse(dl_url).path
-        name = pathlib.Path(path).name
-        if name:
-            return name
-        return f"{self.name}.fibrepack"
-
-    @staticmethod
-    def _extract_ota_download_url(data: Dict[str, Any]) -> Optional[str]:
-        # Support both release_info style and platform config style keys.
-        for key in ("download_url", "downloadUrl", "url", "update-url"):
-            val = data.get(key)
-            if isinstance(val, str) and val.strip():
-                return val.strip()
-        return None
-
-    async def _get_remote_version_ota(self) -> None:
-        assert self.ota_manifest_url is not None
-        client = self.cmd_helper.get_http_client()
-        resp = await client.request(
-            "GET",
-            self.ota_manifest_url,
-            enable_cache=False,
-            attempts=3,
-            retry_pause_time=.5,
-            request_timeout=30.,
-        )
-        if resp.has_error() or resp.status_code >= 400:
-            err = resp.error or f"HTTP {resp.status_code}"
-            self.log_info(f"OTA manifest request failed: {err}")
-            self.last_error = str(err)
-            return
-        try:
-            data: Dict[str, Any] = resp.json()
-        except Exception:
-            logging.exception("Failed to parse OTA manifest JSON")
-            self.last_error = "Invalid OTA manifest JSON"
-            return
-        logging.info(f"OTA manifest data: {data}")
-        remote_ver = data.get("version")
-        dl_url = self._extract_ota_download_url(data)
-        if not remote_ver or not dl_url:
-            self.last_error = (
-                "OTA manifest missing 'version' or download url "
-                "(download_url/update-url)"
-            )
-            self.log_info(self.last_error)
-            return
-        # update-url may be a directory entry in platform config manifests.
-        if dl_url.endswith("/"):
-            self.last_error = (
-                "OTA manifest provides a directory update-url, expected direct "
-                "package URL (e.g. *.fibrepack)"
-            )
-            self.log_info(self.last_error)
-            return
-        self.remote_version = str(remote_ver)
-        self.body_message = await self._format_ota_release_notes(data)
-        self.dl_info = (str(dl_url), "application/octet-stream", -1)
-        self.last_error = ""
-        self._is_prerelease = False
-
-    @staticmethod
-    def _format_ota_release_notes(data: Dict[str, Any]) -> str:
-        rn = data.get("release_note")
-        if isinstance(rn, dict):
-            parts: List[str] = []
-            for key in ("cn", "en"):
+            lang = (language or "").strip()
+            # Exact locale first, then normalized locale, then language defaults.
+            candidates = [lang]
+            if "-" in lang:
+                alt = lang.replace("-", "_")
+                if alt not in candidates:
+                    candidates.append(alt)
+            if "_" in lang:
+                alt = lang.replace("_", "-")
+                if alt not in candidates:
+                    candidates.append(alt)
+            lower_lang = lang.lower()
+            if lower_lang.startswith("zh"):
+                candidates += ["zh-CN", "zh_CN", "cn", "zh-TW", "zh_TW"]
+            elif lower_lang.startswith("en"):
+                candidates += ["en-US", "en_US", "en"]
+            elif lower_lang.startswith("ja"):
+                candidates += ["ja-JP", "ja_JP"]
+            elif lower_lang.startswith("ko"):
+                candidates += ["ko-KR", "ko_KR"]
+            elif lower_lang.startswith("de"):
+                candidates += ["de-DE", "de_DE"]
+            elif lower_lang.startswith("fr"):
+                candidates += ["fr-FR", "fr_FR"]
+            elif lower_lang.startswith("es"):
+                candidates += ["es-ES", "es_ES"]
+            elif lower_lang.startswith("it"):
+                candidates += ["it-IT", "it_IT"]
+            elif lower_lang.startswith("ru"):
+                candidates += ["ru-RU", "ru_RU"]
+            for key in candidates:
+                if not key:
+                    continue
                 val = rn.get(key)
                 if val:
-                    parts.append(str(val))
-            return "\n".join(parts)
+                    return str(val)
+            # Fallback to English when local language is unavailable.
+            for key in ("en-US", "en_US", "en"):
+                val = rn.get(key)
+                if val:
+                    return str(val)
+            return ""
         if isinstance(rn, str):
             return rn
         return ""
@@ -452,7 +417,11 @@ class NetDeploy(AppDeploy):
             self.log_info(self.last_error)
             return
         self.remote_version = str(remote_ver)
-        self.body_message = self._format_ota_release_notes(data) or None
+        database = self.server.lookup_component("database", None)
+        language: Optional[str] = None
+        if database is not None:
+            language = await database.get_item("fibretouch", "language", "en-US")
+        self.body_message = self._format_ota_release_notes(data, language) or None
         self.dl_info = (str(dl_url), "application/octet-stream", -1)
         self.last_error = ""
         self._is_prerelease = False
