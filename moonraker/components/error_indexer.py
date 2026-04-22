@@ -160,7 +160,9 @@ class ErrorIndexer:
             return None
         if not placeholders:
             try:
-                return re.compile(re.escape(template), re.IGNORECASE)
+                # 无占位符时也使用整行匹配，避免子串误命中
+                pattern = "^" + re.escape(template) + "$"
+                return re.compile(pattern, re.IGNORECASE)
             except re.error:
                 return None
         parts = re.split(r"(%\d+)", template)
@@ -356,7 +358,8 @@ class ErrorIndexer:
             msg_re = entry.get("msg_re")
             if msg_re is None:
                 continue
-            m = msg_re.search(message)
+            # 统一使用 fullmatch，避免正则 search 导致的子串误匹配
+            m = msg_re.fullmatch(message)
             if not m:
                 continue
             groups = m.groups() if m.lastindex else ()
@@ -522,12 +525,6 @@ class ErrorIndexer:
             match_result = self._match_error_code_in_db(error_msg, db)
             if match_result:
                 code, placeholder_values = match_result
-            else:
-                for c, ent in db.items():
-                    msg_match = ent.get("msg_match")
-                    if msg_match and msg_match in error_msg:
-                        code = c
-                        break
         if not code:
             code = "UNKNOWN"
         if placeholder_values is None:

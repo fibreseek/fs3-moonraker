@@ -357,25 +357,34 @@ class KlippyAPI(APITransport):
                 try:
                     # 根据 print_mode 选择需要检查的传感器
                     filament_sensors: List[str] = []
-                    extruder_text = ""
+                    sensor_missing_texts: Dict[str, str] = {}
                     if print_mode == 0:  # Plastic Only
-                        extruder_text = "Right Extruder"
                         filament_sensors = [
                             "filament_switch_sensor filament_sensor_3",
                         ]
+                        sensor_missing_texts = {
+                            "filament_switch_sensor filament_sensor_3": "Right plastic missing",
+                        }
                     elif print_mode == 1: # Plastic and Composite
-                        extruder_text = "Left and Right Extruder"
                         filament_sensors = [
                             "filament_switch_sensor filament_sensor",
                             "filament_switch_sensor filament_sensor_1",
                             "filament_switch_sensor filament_sensor_3",
                         ]
+                        sensor_missing_texts = {
+                            "filament_switch_sensor filament_sensor": "Left fiber missing",
+                            "filament_switch_sensor filament_sensor_1": "Left plastic missing",
+                            "filament_switch_sensor filament_sensor_3": "Right plastic missing",
+                        }
                     elif print_mode == 2: # Composite Only
-                        extruder_text = "Left Extruder"
                         filament_sensors = [
                             "filament_switch_sensor filament_sensor",
-                            "filament_switch_sensor filament_sensor_1", 
+                            "filament_switch_sensor filament_sensor_1",
                         ]
+                        sensor_missing_texts = {
+                            "filament_switch_sensor filament_sensor": "Left fiber missing",
+                            "filament_switch_sensor filament_sensor_1": "Left plastic missing",
+                        }
 
                     if not filament_sensors:
                         logging.info(f"Filament precheck: no sensors configured for print_mode={print_mode}, skipping filament presence check")
@@ -399,7 +408,24 @@ class KlippyAPI(APITransport):
                                     missing.append(name)
 
                             if missing:
-                                msg = (f"{extruder_text} detected missing filament")
+                                # 按传感器配置顺序拼接缺料提示，确保提示文本稳定可预期
+                                missing_msgs = [
+                                    sensor_missing_texts.get(name, f"Filament missing at {name}")
+                                    for name in filament_sensors
+                                    if name in missing
+                                ]
+                                def _lower_initial(text: str) -> str:
+                                    if not text:
+                                        return text
+                                    return text[0].lower() + text[1:]
+                                if len(missing_msgs) == 1:
+                                    msg = missing_msgs[0]
+                                elif len(missing_msgs) == 2:
+                                    msg = f"{missing_msgs[0]} and {_lower_initial(missing_msgs[1])}"
+                                else:
+                                    middle_msgs = [_lower_initial(item) for item in missing_msgs[1:-1]]
+                                    last_msg = _lower_initial(missing_msgs[-1])
+                                    msg = f"{missing_msgs[0]}, {', '.join(middle_msgs)}, and {last_msg}"
                                 logging.warning("%s. Missing sensors: %s", msg, ", ".join(missing))
                                 self.server.send_event(
                                     "precheck:failed",
