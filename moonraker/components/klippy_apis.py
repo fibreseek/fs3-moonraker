@@ -189,6 +189,8 @@ class KlippyAPI(APITransport):
         if filename[0] == '/':
             filename = filename[1:]
 
+        await self._validate_print_start_state()
+
         # 保存带子文件夹路径的文件名，用于 SAVE_VARIABLE
         filename_with_path = filename
         filename_only = os.path.basename(filename)
@@ -283,6 +285,25 @@ class KlippyAPI(APITransport):
         self.server.send_event("klippy_apis:job_start_complete", user)
         logging.info(" leave start_print")
         return ret
+
+    async def _validate_print_start_state(self) -> None:
+        """
+        开始打印前校验打印机状态，仅允许 standby 状态发起打印。
+        """
+        try:
+            status = await self.query_objects({"print_stats": ["state"]})
+        except Exception as e:
+            logging.warning(f"Unable to query print_stats.state before start: {e}")
+            raise self.server.error(
+                "Unable to verify printer state before start_print", 503
+            )
+
+        print_stats = status.get("print_stats", {}) if isinstance(status, dict) else {}
+        state = str(print_stats.get("state", "")).strip().lower()
+        if state != "standby":
+            msg = f"Printer state '{state or 'unknown'}' does not allow start_print"
+            logging.warning(msg)
+            raise self.server.error(msg, 409)
 
     async def _run_precheck(
         self,
