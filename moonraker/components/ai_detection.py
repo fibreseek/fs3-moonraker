@@ -1404,8 +1404,9 @@ class AIDetectionClient:
                 )
                 self._start_defect_timer()
         elif job_event in (JobEvent.PAUSED, JobEvent.COMPLETE,
-                           JobEvent.ERROR, JobEvent.CANCELLED):
-            # 打印暂停、完成、错误或取消
+                           JobEvent.ERROR, JobEvent.CANCELLED,
+                           JobEvent.STANDBY):
+            # 打印暂停、完成、错误、取消或回到 standby
             if self._is_detecting:
                 logging.info(
                     f"AI Detection: Stopping defect detection timer "
@@ -1425,6 +1426,7 @@ class AIDetectionClient:
 
     def _stop_defect_timer(self) -> None:
         """停止缺陷检测定时器"""
+        logging.info("Stop the defect detection timer")
         self._is_detecting = False
         if self._defect_timer is not None:
             self._defect_timer.cancel()
@@ -1513,21 +1515,37 @@ class AIDetectionClient:
 
         return False
 
+    def _can_auto_pause_print(self) -> bool:
+        """仅在实际打印中允许 AI 发起自动暂停。"""
+        try:
+            job_state = self.server.lookup_component("job_state")
+            job_event = job_state.get_last_job_event()
+        except Exception as e:
+            logging.warning(
+                f"AI Detection: Unable to determine job state before auto-pause: {e}"
+            )
+            return False
+        return job_event in (JobEvent.STARTED, JobEvent.RESUMED)
+
     async def _pause_print(self, result: DefectDetectionResult) -> None:
         """暂停打印
 
         Args:
             result: DefectDetectionResult
         """
+        if not self._can_auto_pause_print():
+            logging.info(
+                "AI Detection: Ignoring auto-pause request because printer is not actively printing"
+            )
+            return
+
         logging.warning("AI Detection: Auto-pausing print due to defect...")
 
         # 获取 klippy_apis 组件并暂停
         klippy_apis = self.server.lookup_component("klippy_apis")
         if klippy_apis:
             try:
-                # 调用暂停打印
-                gcode_script = "PAUSE"
-                await klippy_apis.run_gcode(gcode_script)
+                await klippy_apis.pause_print()
                 logging.info("AI Detection: Print paused successfully")
             except Exception as e:
                 logging.error(
