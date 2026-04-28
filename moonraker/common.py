@@ -118,6 +118,7 @@ class JobEvent(ExtendedEnum):
     PRECHECK = 2
     PREPRINTING = 3
     PAUSING = 4
+    BUSY = 5
     STARTED = 10
     PAUSED = 20
     RESUMED = 30
