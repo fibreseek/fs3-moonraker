@@ -77,10 +77,35 @@ class KlippyAPI(APITransport):
         self.server.register_event_handler(
             "server:klippy_disconnect", self._on_klippy_disconnect
         )
+        self.server.register_event_handler(
+            "history:history_changed", self._handle_history_changed
+        )
 
     def _on_klippy_disconnect(self) -> None:
         self.host_subscription.clear()
         self.subscription_callbacks.clear()
+
+    async def _handle_history_changed(
+        self, history_event: Dict[str, Any]
+    ) -> None:
+        if history_event.get("action") != "added":
+            return
+        job = history_event.get("job", {})
+        if not isinstance(job, Mapping):
+            return
+        job_id = job.get("job_id")
+        if not isinstance(job_id, str) or not job_id:
+            return
+        await self._save_printing_info_job_id(job_id)
+
+    async def _save_printing_info_job_id(self, job_id: str) -> None:
+        try:
+            await self.run_gcode(
+                f"SAVE_VARIABLE VARIABLE=printing_info_job_id VALUE='\"{job_id}\"'"
+            )
+            logging.info(f"Updated printing_info_job_id from history: {job_id}")
+        except Exception as e:
+            logging.warning(f"Failed to save actual job_id '{job_id}': {e}")
 
     async def _gcode_pause(self, web_request: WebRequest) -> str:
         return await self.pause_print()
@@ -199,21 +224,7 @@ class KlippyAPI(APITransport):
         file_manager = self.server.lookup_component("file_manager")
         metadata = file_manager.get_file_metadata(filename)
 
-        # 预测下一个 job_id
-        predicted_job_id = "UNKNOWN"
-        try:
-            history = self.server.lookup_component("history")
-            # 获取历史记录中最大的 job_id
-            max_job_id = await self._get_max_job_id(history)
-            if max_job_id is not None:
-                # 预测下一个 job_id (最大值 + 1)
-                next_job_id = max_job_id + 1
-                predicted_job_id = f"{next_job_id:06X}"
-                logging.info(f"Predicted job_id for this print: {predicted_job_id} (decimal: {next_job_id})")
-            else:
-                logging.warning("Unable to predict job_id, no history records found")
-        except Exception as e:
-            logging.warning(f"Failed to predict job_id: {e}")
+        save_commands: List[str] = []
 
         # 初始化变量，确保即使没有元数据也有默认值
         print_mode: int = -1
@@ -235,8 +246,7 @@ class KlippyAPI(APITransport):
             y_max = bounding_box.get("y_max", 0.0)
             
             # 构造 SAVE_VARIABLE 命令列表
-            save_commands = [
-                f"SAVE_VARIABLE VARIABLE=printing_info_job_id VALUE='\"{predicted_job_id}\"'",
+            save_commands.extend([
                 f"SAVE_VARIABLE VARIABLE=printing_info_filename VALUE='\"{filename_with_path}\"'",
                 f"SAVE_VARIABLE VARIABLE=printing_info_print_mode VALUE={print_mode}",
                 f"SAVE_VARIABLE VARIABLE=printing_info_left_preheat_temperature VALUE={left_temp}",
@@ -249,22 +259,22 @@ class KlippyAPI(APITransport):
                 f"SAVE_VARIABLE VARIABLE=printing_info_mode_y_max VALUE={y_max}",
                 f"SAVE_VARIABLE VARIABLE=printing_info_mode_y_min VALUE={y_min}",
                 f"_SET_TIMELAPSE_SETUP ENABLE={str(timelapse).lower()}"
-            ]
+            ])
 
-            # 依次执行所有参数设置命令
-            for cmd in save_commands:
-                try:
-                    await self.run_gcode(cmd)
-                    logging.info(f"Executed: {cmd}")
-                except Exception as e:
-                    logging.warning(f"Failed to execute command '{cmd}': {e}")
         else:
             logging.warning(f"No metadata found for file: {filename}, skipping parameter setup")
             # 即使没有元数据，也保存带路径的文件名
+            save_commands.append(
+                f"SAVE_VARIABLE VARIABLE=printing_info_filename "
+                f"VALUE='\"{filename_with_path}\"'"
+            )
+        # 统一执行参数设置命令
+        for cmd in save_commands:
             try:
-                await self.run_gcode(f"SAVE_VARIABLE VARIABLE=printing_info_filename VALUE='\"{filename_with_path}\"'")
+                await self.run_gcode(cmd)
+                logging.info(f"Executed: {cmd}")
             except Exception as e:
-                logging.warning(f"Failed to save filename with path: {e}")
+                logging.warning(f"Failed to execute command '{cmd}': {e}")
 
         # 打印前预检查（AI / 传感器等）
         if not skip_precheck:
@@ -515,25 +525,6 @@ class KlippyAPI(APITransport):
             except Exception as e:
                 logging.warning(f"Precheck: failed to reset print_stats.state to standby: {e}")
             raise
-
-    async def _get_max_job_id(self, history) -> Optional[int]:
-        """
-        从历史记录表中获取最大的 job_id
-        返回: 最大的 job_id (整数)，如果没有记录则返回 None
-        """
-        try:
-            cursor = await history.history_table.execute(
-                "SELECT MAX(job_id) FROM job_history"
-            )
-            result = await cursor.fetchone()
-            if result and result[0] is not None:
-                return result[0]
-            return None
-        except Exception as e:
-            logging.error(f"Error getting max job_id: {e}")
-            return None
-     
-    
     def _parse_print_mode(self, mode_str: str) -> int:
         """
         解析打印模式字符串为数值
