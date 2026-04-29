@@ -377,6 +377,35 @@ class NetDeploy(AppDeploy):
                 return val.strip()
         return None
 
+    @staticmethod
+    def _parse_version_parts(version: str) -> Tuple[int, ...]:
+        parts = [part for part in version.strip().split(".") if part != ""]
+        parsed: List[int] = []
+        for part in parts:
+            if not part.isdigit():
+                return tuple()
+            parsed.append(int(part))
+        return tuple(parsed)
+
+    @classmethod
+    def _compare_versions(cls, left: str, right: str) -> Optional[int]:
+        left_parts = cls._parse_version_parts(left)
+        right_parts = cls._parse_version_parts(right)
+        if not left_parts or not right_parts:
+            return None
+        max_len = max(len(left_parts), len(right_parts))
+        left_norm = left_parts + (0,) * (max_len - len(left_parts))
+        right_norm = right_parts + (0,) * (max_len - len(right_parts))
+        if left_norm > right_norm:
+            return 1
+        if left_norm < right_norm:
+            return -1
+        return 0
+
+    @staticmethod
+    def _normalize_model_name(model: str) -> str:
+        return "".join(model.lower().split())
+
     async def _get_remote_version_ota(self) -> None:
         assert self.ota_manifest_url is not None
         client = self.cmd_helper.get_http_client()
@@ -416,7 +445,62 @@ class NetDeploy(AppDeploy):
             )
             self.log_info(self.last_error)
             return
-        self.remote_version = str(remote_ver)
+        remote_ver_str = str(remote_ver).strip()
+        machine = self.server.lookup_component("machine", None)
+        if machine is not None:
+            remote_model = data.get("model", None)
+            if isinstance(remote_model, str) and remote_model.strip():
+                current_model = machine.get_machine_type()
+                if (
+                    self._normalize_model_name(current_model) !=
+                    self._normalize_model_name(remote_model)
+                ):
+                    self.log_info(
+                        f"Skip OTA push due to model mismatch: "
+                        f"current={current_model}, remote={remote_model}"
+                    )
+                    self.remote_version = self.version
+                    self.body_message = None
+                    self.last_error = ""
+                    return
+            min_hw_raw = data.get("min_hw_version", None)
+            if min_hw_raw is not None:
+                cur_hw_str = machine.get_motherboard_hardware()
+                try:
+                    min_hw_ver = float(min_hw_raw)
+                    cur_hw_ver = float(cur_hw_str)
+                except Exception:
+                    self.log_info(
+                        f"Skip min_hw_version check, parse failed: "
+                        f"current={cur_hw_str}, min={min_hw_raw}"
+                    )
+                else:
+                    if cur_hw_ver < min_hw_ver:
+                        self.log_info(
+                            f"Skip OTA push due to hardware version: "
+                            f"current={cur_hw_ver:.1f}, required>={min_hw_ver:.1f}"
+                        )
+                        self.remote_version = self.version
+                        self.body_message = None
+                        self.last_error = ""
+                        return
+            current_fw = machine.get_firmware_version()
+            cmp_result = self._compare_versions(current_fw, remote_ver_str)
+            if cmp_result is None:
+                self.log_info(
+                    f"Skip firmware version compare, parse failed: "
+                    f"current={current_fw}, remote={remote_ver_str}"
+                )
+            elif cmp_result > 0:
+                self.log_info(
+                    f"Skip OTA push due to firmware version: "
+                    f"current={current_fw} > remote={remote_ver_str}"
+                )
+                self.remote_version = self.version
+                self.body_message = None
+                self.last_error = ""
+                return
+        self.remote_version = remote_ver_str
         database = self.server.lookup_component("database", None)
         language: Optional[str] = None
         if database is not None:

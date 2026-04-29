@@ -76,6 +76,26 @@ SERVICE_PROPERTIES = [
     "User"
 ]
 USB_IDS_URL = "http://www.linux-usb.org/usb.ids"
+BOARD_VOLTAGE_RAW_PATH = "/sys/bus/iio/devices/iio:device0/in_voltage7_raw"
+FIBRETOUCH_SYSTEM_VERSION_PATH = "/proc/fibre_seek_system_version"
+PRINTER_TYPE_NAME_MAP = {
+    "01": "FibreSeeker 3",
+    "02": "FibreSeeker 2",
+    "03": "FibreSeeker 1",
+}
+VOLTAGE_THRESHOLD_1_1 = 1023
+VOLTAGE_THRESHOLD_1_2_MIN = 104
+VOLTAGE_THRESHOLD_1_2_MAX = 112
+VOLTAGE_THRESHOLD_1_3_MIN = 153
+VOLTAGE_THRESHOLD_1_3_MAX = 270
+VOLTAGE_THRESHOLD_2_0_MIN = 270
+VOLTAGE_THRESHOLD_2_0_MAX = 433
+VOLTAGE_THRESHOLD_2_1_MIN = 433
+VOLTAGE_THRESHOLD_2_1_MAX = 611
+VOLTAGE_THRESHOLD_2_2_MIN = 611
+VOLTAGE_THRESHOLD_2_2_MAX = 782
+VOLTAGE_THRESHOLD_2_3_MIN = 782
+VOLTAGE_THRESHOLD_2_3_MAX = 952
 
 class Machine:
     def __init__(self, config: ConfigHelper) -> None:
@@ -104,6 +124,10 @@ class Machine:
         # Initialize machine_name with default value
         self._parameters["machine_name"] = "FibreSeeker 3"
         self._parameters["machine_id"] = self._gen_machine_id()
+        self._parameters["machine_type"] = self._get_machine_type()
+        self._parameters["motherboard_hardware"] = self._get_motherboard_hardware()
+        self._parameters["firmware_version"] = self._get_firmware_version()
+        self._parameters["fibretouch_system_verison"] = self._get_fibretouch_system_verison()
         self.system_info: Dict[str, Any] = {
             'python': {
                 "version": tuple(sys.version_info),
@@ -241,7 +265,7 @@ class Machine:
             machine_id = machine_id.rjust(12, "0")  # 不足补0
 
         # 拼接两个字符的机器型号在machine_id的开头
-        machine_type = self.config.get("printer_type_code", "00")
+        machine_type = self._get_machine_type_code()
         machine_id = machine_type + machine_id
 
         logging.info(f"Generated machine ID: {machine_id}")
@@ -253,6 +277,101 @@ class Machine:
     def get_machine_name(self) -> str:
         """Get the current machine name"""
         return self._parameters.get("machine_name", "FibreSeeker 3")
+
+    def get_machine_type(self) -> str:
+        return self._parameters.get("machine_type", self._get_machine_type())
+
+    def get_motherboard_hardware(self) -> str:
+        return self._parameters.get("motherboard_hardware", "")
+
+    def get_firmware_version(self) -> str:
+        return self._parameters.get("firmware_version", "")
+
+    def get_fibretouch_system_verison(self) -> str:
+        return self._parameters.get("fibretouch_system_verison", "")
+
+    def _get_machine_type_code(self) -> str:
+        machine_type_code = self.config.get("printer_type_code", "00")
+        if not isinstance(machine_type_code, str):
+            return "00"
+        return machine_type_code.strip()
+
+    def _get_machine_type(self) -> str:
+        machine_type_code = self._get_machine_type_code()
+        return PRINTER_TYPE_NAME_MAP.get(machine_type_code, "UNKNOWN")
+
+    @staticmethod
+    def _hw_version_from_adc(adc_raw: int) -> Optional[float]:
+        if adc_raw < 0:
+            return None
+        if VOLTAGE_THRESHOLD_2_3_MIN <= adc_raw < VOLTAGE_THRESHOLD_2_3_MAX:
+            return 2.3
+        if VOLTAGE_THRESHOLD_2_2_MIN <= adc_raw < VOLTAGE_THRESHOLD_2_2_MAX:
+            return 2.2
+        if VOLTAGE_THRESHOLD_2_1_MIN <= adc_raw < VOLTAGE_THRESHOLD_2_1_MAX:
+            return 2.1
+        if VOLTAGE_THRESHOLD_2_0_MIN <= adc_raw < VOLTAGE_THRESHOLD_2_0_MAX:
+            return 2.0
+        if VOLTAGE_THRESHOLD_1_3_MIN <= adc_raw < VOLTAGE_THRESHOLD_1_3_MAX:
+            return 1.3
+        if VOLTAGE_THRESHOLD_1_2_MIN <= adc_raw < VOLTAGE_THRESHOLD_1_2_MAX:
+            return 1.2
+        if VOLTAGE_THRESHOLD_2_3_MAX < adc_raw <= VOLTAGE_THRESHOLD_1_1:
+            return 1.1
+        return None
+
+    def _get_motherboard_hardware(self) -> str:
+        try:
+            raw_val = pathlib.Path(BOARD_VOLTAGE_RAW_PATH).read_text().strip()
+            adc_raw = int(raw_val)
+        except Exception as e:
+            logging.info(f"Failed to read motherboard hardware adc value: {e}")
+            return ""
+        hw_version = self._hw_version_from_adc(adc_raw)
+        if hw_version is None:
+            logging.info(f"Unknown motherboard hardware adc value: {adc_raw}")
+            return ""
+        result = f"{hw_version:.1f}"
+        logging.info(f"Read motherboard_hardware: {result}")
+        return result
+
+    def _get_firmware_version(self) -> str:
+        release_info_path: Optional[pathlib.Path] = None
+        try:
+            updater_cfg = self.config.getsection("update_manager fibreseek-updater")
+            update_path = updater_cfg.getpath("path", None)
+            if isinstance(update_path, pathlib.Path):
+                release_info_path = update_path.joinpath("release_info.json")
+            if release_info_path is None:
+                return ""
+            release_info = jsonw.loads(release_info_path.read_text())
+            version = release_info.get("version", "")
+            if isinstance(version, str):
+                logging.info(f"Read app_version: {version}")
+                return version
+            str_version = str(version)
+            logging.info(f"Read app_version: {str_version}")
+            return str_version
+        except Exception as e:
+            if release_info_path is None:
+                logging.info(f"Failed to resolve app_version path: {e}")
+            else:
+                logging.info(f"Failed to read app_version from {release_info_path}: {e}")
+            return ""
+
+    def _get_fibretouch_system_verison(self) -> str:
+        try:
+            content = pathlib.Path(FIBRETOUCH_SYSTEM_VERSION_PATH).read_text().strip()
+            match = re.search(r"version\s*:\s*(.+)", content, re.IGNORECASE)
+            if match is not None:
+                result = match.group(1).strip()
+                logging.info(f"Read fibretouch_system_verison: {result}")
+                return result
+            logging.info(f"Read fibretouch_system_verison: {content}")
+            return content
+        except Exception as e:
+            logging.info(f"Failed to read fibretouch_system_verison: {e}")
+            return ""
 
     async def set_machine_name(self, new_value: str) -> None:
         """Set the machine name and persist it to database"""
@@ -302,6 +421,40 @@ class Machine:
             logging.info(f"Failed to load parameters: {e}")
             # Set default value if database loading fails
             await self.database.insert_item("fibretouch", "machine_id", self._parameters["machine_id"])
+
+        self._parameters["machine_type"] = self._get_machine_type()
+        try:
+            await self.database.insert_item(
+                "fibretouch", "machine_type", self._parameters["machine_type"]
+            )
+        except Exception as e:
+            logging.info(f"Failed to sync machine_type: {e}")
+
+        self._parameters["motherboard_hardware"] = self._get_motherboard_hardware()
+        try:
+            await self.database.insert_item(
+                "fibretouch", "motherboard_hardware", self._parameters["motherboard_hardware"]
+            )
+        except Exception as e:
+            logging.info(f"Failed to sync motherboard_hardware: {e}")
+
+        self._parameters["firmware_version"] = self._get_firmware_version()
+        try:
+            await self.database.insert_item(
+                "fibretouch", "firmware_version", self._parameters["firmware_version"]
+            )
+        except Exception as e:
+            logging.info(f"Failed to sync app_version: {e}")
+
+        self._parameters["fibretouch_system_verison"] = self._get_fibretouch_system_verison()
+        try:
+            await self.database.insert_item(
+                "fibretouch",
+                "fibretouch_system_verison",
+                self._parameters["fibretouch_system_verison"]
+            )
+        except Exception as e:
+            logging.info(f"Failed to sync fibretouch_system_verison: {e}")
 
     def _init_allowed_services(self) -> None:
         app_args = self.server.get_app_args()

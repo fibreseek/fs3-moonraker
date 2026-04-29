@@ -85,27 +85,13 @@ class PrinterSetting:
             "machine:machine_id_changed",
             lambda value: self._queue_setting_change("fibretouch", {"machine_id": value})
         )
-    
-    def _get_firmware_version(self) -> str:
-        """Get firmware version from release_info.json"""
-        import json
-        import os
-        release_info_path = "/home/anisoprint/sk3-ota/release_info.json"
-        try:
-            if os.path.exists(release_info_path):
-                with open(release_info_path, 'r', encoding='utf-8') as f:
-                    data = json.load(f)
-                    return data.get("version", "")
-        except Exception as e:
-            logging.exception(f"Error reading firmware version: {e}")
-        return ""
 
     async def _init_setting_cache(self) -> None:
         """Initialize setting cache with default values"""
         self._setting_cache["fibretouch"] = {
             "machine_name": self.machine.get_machine_name(),
             "machine_id": self.machine.get_machine_id(),
-            "firmware_version": self._get_firmware_version(),
+            "firmware_version": self.machine.get_firmware_version(),
         }
         fibretouch_items = await self.database.ns_items("fibretouch")
         self._setting_cache["fibretouch"].update(fibretouch_items)
@@ -155,8 +141,11 @@ class PrinterSetting:
                         await self.machine.set_machine_name(value)
                         # machine_name change will be handled by the event handler
                         updated_params[key] = self.machine.get_machine_name()
-                    elif key == "machine_id" or key == "firmware_version":
-                        # machine_id and firmware_version are not settable
+                    elif key in (
+                        "machine_id",
+                        "firmware_version"
+                    ):
+                        # machine_id/firmware_version/app_version/fibretouch_system_verison are not settable
                         continue
                     else:
                         # 其他参数直接设置到数据库中
