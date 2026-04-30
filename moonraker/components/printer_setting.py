@@ -92,6 +92,9 @@ class PrinterSetting:
             "machine_name": self.machine.get_machine_name(),
             "machine_id": self.machine.get_machine_id(),
             "firmware_version": self.machine.get_firmware_version(),
+            "serial_num": self.machine.get_serial_num(),
+            "machine_type": self.machine.get_machine_type(),
+            "fibretouch_system_verison": self.machine.get_fibretouch_system_verison(),
         }
         fibretouch_items = await self.database.ns_items("fibretouch")
         self._setting_cache["fibretouch"].update(fibretouch_items)
@@ -143,9 +146,12 @@ class PrinterSetting:
                         updated_params[key] = self.machine.get_machine_name()
                     elif key in (
                         "machine_id",
-                        "firmware_version"
+                        "firmware_version",
+                        "serial_num",
+                        "machine_type",
+                        "fibretouch_system_verison",
                     ):
-                        # machine_id/firmware_version/app_version/fibretouch_system_verison are not settable
+                        # machine_id/firmware_version/serial_num/machine_type/fibretouch_system_verison are not settable
                         continue
                     else:
                         # 其他参数直接设置到数据库中

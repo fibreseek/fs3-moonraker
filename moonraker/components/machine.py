@@ -8,6 +8,7 @@ from __future__ import annotations
 import sys
 import os
 import re
+import base64
 import pathlib
 import logging
 import asyncio
@@ -22,6 +23,7 @@ import getpass
 import configparser
 import hashlib
 import uuid
+import subprocess
 from ..confighelper import FileSourceWrapper
 from ..utils import source_info, cansocket, sysfs_devs, load_system_module
 from ..utils import json_wrapper as jsonw
@@ -78,6 +80,8 @@ SERVICE_PROPERTIES = [
 USB_IDS_URL = "http://www.linux-usb.org/usb.ids"
 BOARD_VOLTAGE_RAW_PATH = "/sys/bus/iio/devices/iio:device0/in_voltage7_raw"
 FIBRETOUCH_SYSTEM_VERSION_PATH = "/proc/fibre_seek_system_version"
+FIBREKEY_PATH = "/home/anisoprint/.fibretouch.fibrekey"
+FIBREKEY_AES_KEY = "FibreKey2024Secure32Bytes!!!!!!!"
 PRINTER_TYPE_NAME_MAP = {
     "01": "FibreSeeker 3",
     "02": "FibreSeeker 2",
@@ -124,10 +128,12 @@ class Machine:
         # Initialize machine_name with default value
         self._parameters["machine_name"] = "FibreSeeker 3"
         self._parameters["machine_id"] = self._gen_machine_id()
-        self._parameters["machine_type"] = self._get_machine_type()
         self._parameters["motherboard_hardware"] = self._get_motherboard_hardware()
         self._parameters["firmware_version"] = self._get_firmware_version()
         self._parameters["fibretouch_system_verison"] = self._get_fibretouch_system_verison()
+        fibrekey_data = self._get_fibrekey_data()
+        self._parameters["serial_num"] = fibrekey_data.get("serial_num", "")
+        self._parameters["machine_type"] = fibrekey_data.get("machine_type", self._get_machine_type())
         self.system_info: Dict[str, Any] = {
             'python': {
                 "version": tuple(sys.version_info),
@@ -290,6 +296,9 @@ class Machine:
     def get_fibretouch_system_verison(self) -> str:
         return self._parameters.get("fibretouch_system_verison", "")
 
+    def get_serial_num(self) -> str:
+        return self._parameters.get("serial_num", "")
+
     def _get_machine_type_code(self) -> str:
         machine_type_code = self.config.get("printer_type_code", "00")
         if not isinstance(machine_type_code, str):
@@ -373,6 +382,51 @@ class Machine:
             logging.info(f"Failed to read fibretouch_system_verison: {e}")
             return ""
 
+    def _get_fibrekey_data(self) -> Dict[str, str]:
+        try:
+            encrypted_content = pathlib.Path(FIBREKEY_PATH).read_text().strip()
+            parts = encrypted_content.split(":", 1)
+            if len(parts) != 2:
+                logging.info("Invalid fibrekey format, expected IV:CipherText")
+                return {"serial_num": "", "machine_type": ""}
+            iv = base64.b64decode(parts[0], validate=True)
+            ciphertext = base64.b64decode(parts[1], validate=True)
+            if len(iv) != 16 or not ciphertext:
+                logging.info("Invalid fibrekey IV or ciphertext")
+                return {"serial_num": "", "machine_type": ""}
+            proc = subprocess.run(
+                [
+                    "openssl", "enc", "-d", "-aes-256-cbc",
+                    "-K", FIBREKEY_AES_KEY.encode("utf-8").hex(),
+                    "-iv", iv.hex(),
+                ],
+                input=ciphertext,
+                capture_output=True,
+                check=False,
+            )
+            if proc.returncode != 0:
+                logging.info(
+                    "Failed to decrypt fibrekey: %s",
+                    proc.stderr.decode("utf-8", errors="ignore").strip()
+                )
+                return {"serial_num": "", "machine_type": ""}
+            payload = jsonw.loads(proc.stdout.decode("utf-8"))
+            serial_num = payload.get("serialNumber", "")
+            machine_type = payload.get("model", "")
+            if not isinstance(serial_num, str):
+                serial_num = str(serial_num)
+            if not isinstance(machine_type, str):
+                machine_type = str(machine_type)
+            logging.info(f"Read serial_num: {serial_num}")
+            logging.info(f"Read machine_type: {machine_type}")
+            return {
+                "serial_num": serial_num,
+                "machine_type": machine_type
+            }
+        except Exception as e:
+            logging.info(f"Failed to read fibrekey data: {e}")
+            return {"serial_num": "", "machine_type": ""}
+
     async def set_machine_name(self, new_value: str) -> None:
         """Set the machine name and persist it to database"""
         # Validate input
@@ -422,15 +476,7 @@ class Machine:
             # Set default value if database loading fails
             await self.database.insert_item("fibretouch", "machine_id", self._parameters["machine_id"])
 
-        self._parameters["machine_type"] = self._get_machine_type()
-        try:
-            await self.database.insert_item(
-                "fibretouch", "machine_type", self._parameters["machine_type"]
-            )
-        except Exception as e:
-            logging.info(f"Failed to sync machine_type: {e}")
-
-        self._parameters["motherboard_hardware"] = self._get_motherboard_hardware()
+        # Already collected during __init__, only sync to database here.
         try:
             await self.database.insert_item(
                 "fibretouch", "motherboard_hardware", self._parameters["motherboard_hardware"]
@@ -438,7 +484,7 @@ class Machine:
         except Exception as e:
             logging.info(f"Failed to sync motherboard_hardware: {e}")
 
-        self._parameters["firmware_version"] = self._get_firmware_version()
+        # Already collected during __init__, only sync to database here.
         try:
             await self.database.insert_item(
                 "fibretouch", "firmware_version", self._parameters["firmware_version"]
@@ -446,7 +492,7 @@ class Machine:
         except Exception as e:
             logging.info(f"Failed to sync app_version: {e}")
 
-        self._parameters["fibretouch_system_verison"] = self._get_fibretouch_system_verison()
+        # Already collected during __init__, only sync to database here.
         try:
             await self.database.insert_item(
                 "fibretouch",
@@ -455,6 +501,25 @@ class Machine:
             )
         except Exception as e:
             logging.info(f"Failed to sync fibretouch_system_verison: {e}")
+
+        # Fibrekey data has already been parsed during startup init.
+        # Keep current in-memory values here and only sync to database.
+        try:
+            await self.database.insert_item(
+                "fibretouch",
+                "serial_num",
+                self._parameters["serial_num"]
+            )
+        except Exception as e:
+            logging.info(f"Failed to sync serial_num: {e}")
+        try:
+            await self.database.insert_item(
+                "fibretouch",
+                "machine_type",
+                self._parameters["machine_type"]
+            )
+        except Exception as e:
+            logging.info(f"Failed to sync machine_type: {e}")
 
     def _init_allowed_services(self) -> None:
         app_args = self.server.get_app_args()
