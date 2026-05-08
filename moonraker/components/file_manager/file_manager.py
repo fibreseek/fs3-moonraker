@@ -1115,15 +1115,37 @@ class FileManager:
             return flist
         return filelist
 
-    def get_file_metadata(self, filename: str) -> Dict[str, Any]:
-        if filename[0] == '/':
-            filename = filename[1:]
-
-        # Remove "gcodes" of its added.  It is valid for a request to
-        # include to the root or assume the root is gcodes
-        if filename.startswith('gcodes/'):
+    def _normalize_gcode_filename(self, filename: str) -> str:
+        filename = filename.lstrip("/")
+        # It is valid for a request to include the root or assume
+        # that the root is gcodes.
+        if filename.startswith("gcodes/"):
             filename = filename[7:]
+        return filename
 
+    def get_file_metadata(self, filename: str) -> Dict[str, Any]:
+        filename = self._normalize_gcode_filename(filename)
+        return self.gcode_metadata.get(filename, {})
+
+    async def ensure_file_metadata(self, filename: str) -> Dict[str, Any]:
+        filename = self._normalize_gcode_filename(filename)
+        metadata = self.gcode_metadata.get(filename, {})
+        gcode_root = self.file_paths.get("gcodes", "")
+        if not gcode_root:
+            return metadata
+        gcode_root_path = pathlib.Path(gcode_root)
+        file_path = gcode_root_path.joinpath(filename)
+        try:
+            file_path.resolve().relative_to(gcode_root_path.resolve())
+        except ValueError:
+            return metadata
+        if not file_path.is_file():
+            return metadata
+        if file_path.suffix.lower() not in VALID_GCODE_EXTS:
+            return metadata
+        path_info = self.get_path_info(file_path, "gcodes")
+        metadata_evt = self.gcode_metadata.parse_metadata(filename, path_info)
+        await metadata_evt.wait()
         return self.gcode_metadata.get(filename, {})
 
     def list_dir(self,

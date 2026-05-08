@@ -222,7 +222,7 @@ class KlippyAPI(APITransport):
 
         # 获取文件元数据
         file_manager = self.server.lookup_component("file_manager")
-        metadata = file_manager.get_file_metadata(filename)
+        metadata = await file_manager.ensure_file_metadata(filename)
 
         save_commands: List[str] = []
 
