@@ -133,7 +133,12 @@ class Machine:
         self._parameters["fibretouch_system_verison"] = self._get_fibretouch_system_verison()
         fibrekey_data = self._get_fibrekey_data()
         self._parameters["serial_num"] = fibrekey_data.get("serial_num", "")
-        self._parameters["machine_type"] = fibrekey_data.get("machine_type", self._get_machine_type())
+        # fibrekey errors return machine_type="" with the key present, so
+        # .get(..., default) would not fall back; empty must use config map.
+        fk_machine_type = fibrekey_data.get("machine_type", "")
+        if not (isinstance(fk_machine_type, str) and fk_machine_type.strip()):
+            fk_machine_type = self._get_machine_type()
+        self._parameters["machine_type"] = fk_machine_type
         self.system_info: Dict[str, Any] = {
             'python': {
                 "version": tuple(sys.version_info),
@@ -285,7 +290,10 @@ class Machine:
         return self._parameters.get("machine_name", "FibreSeeker 3")
 
     def get_machine_type(self) -> str:
-        return self._parameters.get("machine_type", self._get_machine_type())
+        mt = self._parameters.get("machine_type", self._get_machine_type())
+        if isinstance(mt, str) and mt.strip():
+            return mt
+        return self._get_machine_type()
 
     def get_motherboard_hardware(self) -> str:
         return self._parameters.get("motherboard_hardware", "")
@@ -300,9 +308,9 @@ class Machine:
         return self._parameters.get("serial_num", "")
 
     def _get_machine_type_code(self) -> str:
-        machine_type_code = self.config.get("printer_type_code", "00")
+        machine_type_code = self.config.get("printer_type_code", "01")
         if not isinstance(machine_type_code, str):
-            return "00"
+            return "01"
         return machine_type_code.strip()
 
     def _get_machine_type(self) -> str:
