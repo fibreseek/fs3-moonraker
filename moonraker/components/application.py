@@ -252,6 +252,11 @@ class MoonrakerApp:
         self.server.register_component("jsonrpc", self.json_rpc)
         self.server.register_component("internal_transport", self.internal_transport)
 
+    def register_notifications(self) -> None:
+        self.server.register_notification(
+            "file_upload:progress", "file_upload_progress"
+        )
+
     def _get_path_option(
         self, config: ConfigHelper, option: str
     ) -> pathlib.Path:
@@ -939,6 +944,48 @@ class FileUploadHandler(AuthorizedRequestHandler):
         self.max_upload_size = max_upload_size
         self.parse_lock = Lock()
         self.parse_failed: bool = False
+        self._upload_progress_enabled: bool = False
+        self._upload_total_bytes: int = 0
+        self._upload_received_bytes: int = 0
+        self._upload_last_percent: int = -1
+        self._upload_filename: Optional[str] = None
+        self._upload_started_emitted: bool = False
+        self._upload_error_emitted: bool = False
+
+    def _notify_upload_progress(
+        self, state: str, force_percent: Optional[int] = None
+    ) -> None:
+        if not self._upload_progress_enabled:
+            return
+        if state == "error" and self._upload_error_emitted:
+            return
+        total = self._upload_total_bytes
+        received = self._upload_received_bytes
+        if force_percent is None:
+            percent = 0 if total <= 0 else min(100, int(received * 100 / total))
+        else:
+            percent = force_percent
+        payload = {
+            "state": state,
+            "percent": percent,
+            "received": received,
+            "total": total,
+            "filename": self._upload_filename,
+        }
+        self.server.send_event("file_upload:progress", payload)
+        self._upload_last_percent = percent
+        if state == "error":
+            self._upload_error_emitted = True
+
+    def _maybe_notify_upload_progress(self) -> None:
+        if not self._upload_progress_enabled or self._upload_total_bytes <= 0:
+            return
+        percent = min(
+            100, int(self._upload_received_bytes * 100 / self._upload_total_bytes)
+        )
+        if percent == self._upload_last_percent:
+            return
+        self._notify_upload_progress("progress", force_percent=percent)
 
     async def prepare(self) -> None:
         ret = super(FileUploadHandler, self).prepare()
@@ -951,9 +998,25 @@ class FileUploadHandler(AuthorizedRequestHandler):
         )
         fm: FileManager = self.server.lookup_component("file_manager")
         fm.check_write_enabled()
+        self._upload_progress_enabled = False
+        self._upload_total_bytes = 0
+        self._upload_received_bytes = 0
+        self._upload_last_percent = -1
+        self._upload_filename = None
+        self._upload_started_emitted = False
+        self._upload_error_emitted = False
         if self.request.method == "POST":
             assert isinstance(self.request.connection, HTTP1Connection)
             self.request.connection.set_max_body_size(self.max_upload_size)
+            content_length = self.request.headers.get("Content-Length")
+            if content_length is not None:
+                try:
+                    total = max(0, int(content_length))
+                except ValueError:
+                    total = 0
+                if total > 0:
+                    self._upload_progress_enabled = True
+                    self._upload_total_bytes = total
             tmpname = self.file_manager.gen_temp_upload_path()
             self._targets = {
                 'root': ValueTarget(),
@@ -971,6 +1034,7 @@ class FileUploadHandler(AuthorizedRequestHandler):
 
     async def data_received(self, chunk: bytes) -> None:
         if self.request.method == "POST" and not self.parse_failed:
+            self._upload_received_bytes += len(chunk)
             async with self.parse_lock:
                 evt_loop = self.server.get_event_loop()
                 try:
@@ -978,11 +1042,21 @@ class FileUploadHandler(AuthorizedRequestHandler):
                 except ParseFailedException:
                     logging.exception("Chunk Parsing Error")
                     self.parse_failed = True
+                    self._notify_upload_progress("error")
+                else:
+                    mp_fname = self._file.multipart_filename
+                    if mp_fname is not None and mp_fname.strip():
+                        self._upload_filename = mp_fname
+                    if not self._upload_started_emitted:
+                        self._notify_upload_progress("started", force_percent=0)
+                        self._upload_started_emitted = True
+                    self._maybe_notify_upload_progress()
 
     async def post(self) -> None:
         if self.parse_failed:
             self._file.on_finish()
             self._remove_temp_file()
+            self._notify_upload_progress("error")
             raise tornado.web.HTTPError(500, "File Upload Parsing Failed")
         form_args = {}
         chk_target = self._targets.pop('checksum')
@@ -992,6 +1066,7 @@ class FileUploadHandler(AuthorizedRequestHandler):
             recd_cksum = chk_target.value.decode().lower()
             if calc_chksum != recd_cksum:
                 self._remove_temp_file()
+                self._notify_upload_progress("error")
                 raise tornado.web.HTTPError(
                     422,
                     f"File checksum mismatch: expected {recd_cksum}, "
@@ -1000,7 +1075,9 @@ class FileUploadHandler(AuthorizedRequestHandler):
         mp_fname: Optional[str] = self._file.multipart_filename
         if mp_fname is None or not mp_fname.strip():
             self._remove_temp_file()
+            self._notify_upload_progress("error")
             raise tornado.web.HTTPError(400, "Multipart filename omitted")
+        self._upload_filename = mp_fname
         for name, target in self._targets.items():
             if target.value:
                 form_args[name] = target.value.decode()
@@ -1016,8 +1093,10 @@ class FileUploadHandler(AuthorizedRequestHandler):
         try:
             result = await self.file_manager.finalize_upload(form_args)
         except ServerError as e:
+            self._notify_upload_progress("error")
             raise tornado.web.HTTPError(
                 e.status_code, str(e))
+        self._notify_upload_progress("completed", force_percent=100)
         # Return 201 and add the Location Header
         item: Dict[str, Any] = result.get('item', {})
         root: Optional[str] = item.get('root', None)

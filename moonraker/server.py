@@ -111,6 +111,7 @@ class Server:
         self.log_manager.set_server(self)
         self.websocket_manager: WebsocketManager
         self.websocket_manager = self.load_component(config, "websockets")
+        app.register_notifications()
 
         for warning in args.get("startup_warnings", []):
             self.add_warning(warning)
