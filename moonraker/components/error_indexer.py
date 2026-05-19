@@ -13,6 +13,7 @@ DB_NAMESPACE = "moonraker"
 WEBHOOK_ERROR_STATES = ("shutdown", "error")
 PLACEHOLDER_RE = re.compile(r"%(\d+)")
 DEFAULT_LANGUAGE = "en-US"
+COMMON_SHEET_NAME = "common"
 
 
 class ErrorIndexer:
@@ -33,9 +34,12 @@ class ErrorIndexer:
         self.error_db: Dict[str, Dict[str, Any]] = {}
         # AI 错误数据库（来自单独的 ai sheet）
         self.ai_error_db: Dict[str, Dict[str, Any]] = {}
+        # common 专有名词翻译表
+        self.common_terms: Dict[str, Dict[str, Dict[str, str]]] = {}
         # 加载错误数据库
         self._load_error_db()
         self._load_ai_error_db()
+        self._load_common_terms()
         logging.info(
             "Error Indexer: Component loaded (module=%s, file_path=%s, language=%s, db_size=%d)",
             __file__, self.file_path, self.language, len(self.error_db)
@@ -302,6 +306,51 @@ class ErrorIndexer:
         except Exception as e:
             logging.error("Error Indexer: Failed to load AI xlsx sheet %s: %s", self.ai_sheet_name, e)
 
+    def _load_common_terms(self) -> None:
+        """从固定的 common sheet 加载占位符专有名词翻译。"""
+        if not os.path.exists(self.file_path):
+            return
+        try:
+            from openpyxl import load_workbook
+        except ImportError:
+            return
+        try:
+            wb = load_workbook(self.file_path, read_only=True, data_only=True)
+            if COMMON_SHEET_NAME not in wb.sheetnames:
+                logging.warning(
+                    "Error Indexer: xlsx sheet %r not found for common terms",
+                    COMMON_SHEET_NAME,
+                )
+                wb.close()
+                return
+            ws = wb[COMMON_SHEET_NAME]
+            self.common_terms = {}
+            for row in ws.iter_rows(min_row=2, values_only=True):
+                row = tuple(row) if row else ()
+                if not row:
+                    continue
+                key = self._row_get(row, 0)
+                if key.startswith("\ufeff"):
+                    key = key[1:]
+                if not key:
+                    continue
+                self.common_terms[key] = {
+                    "default": self._parse_multi_lang(self._row_get(row, 1)),
+                    "10049": self._parse_multi_lang(self._row_get(row, 2)),
+                }
+            wb.close()
+            if self.common_terms:
+                logging.info(
+                    "Error Indexer: Successfully loaded %d common terms from xlsx sheet %s",
+                    len(self.common_terms),
+                    COMMON_SHEET_NAME,
+                )
+        except Exception as e:
+            logging.error(
+                "Error Indexer: Failed to load common xlsx sheet %s: %s",
+                COMMON_SHEET_NAME, e
+            )
+
     def _parse_multi_lang(self, text: str) -> Dict[str, str]:
         """解析多语言字符串，支持 xx-XX: 或 xx-XX： 开头，每行一种语言。"""
         if not text:
@@ -369,6 +418,38 @@ class ErrorIndexer:
     def _match_error_code(self, message: str) -> Optional[Tuple[str, Tuple[str, ...]]]:
         """匹配主错误库（klipper sheet）中的错误消息。"""
         return self._match_error_code_in_db(message, self.error_db)
+
+    def _resolve_placeholder_value(
+        self, error_code: str, raw_value: str, lang: str
+    ) -> str:
+        """通过 common 词条解析单个占位符，未命中时保留原始值。"""
+        entry = self.common_terms.get(raw_value)
+        if not entry:
+            return raw_value
+        if error_code == "10049":
+            special_multi = entry.get("10049", {}) or {}
+            for cand in self._locale_candidates(lang):
+                translated = special_multi.get(cand, "")
+                if translated:
+                    return translated
+        default_multi = entry.get("default", {}) or {}
+        for cand in self._locale_candidates(lang):
+            translated = default_multi.get(cand, "")
+            if translated:
+                return translated
+        return raw_value
+
+    def _resolve_placeholder_values(
+        self,
+        error_code: str,
+        placeholder_values: Tuple[str, ...],
+        lang: str,
+    ) -> Tuple[str, ...]:
+        """在渲染本地化描述前，统一解析所有占位符。"""
+        return tuple(
+            self._resolve_placeholder_value(error_code, raw_value, lang)
+            for raw_value in placeholder_values
+        )
 
     def _handle_gcode_response(self, response: str) -> None:
         """Process G-code response, !!开头视为标准错误并匹配."""
@@ -529,6 +610,9 @@ class ErrorIndexer:
             code = "UNKNOWN"
         if placeholder_values is None:
             placeholder_values = ()
+        resolved_placeholder_values = self._resolve_placeholder_values(
+            code, placeholder_values, self.language
+        )
 
         entry = db.get(code, {})
 
@@ -537,7 +621,7 @@ class ErrorIndexer:
             solution = ""
         else:
             description = self._get_description(
-                entry, self.language, placeholder_values=placeholder_values
+                entry, self.language, placeholder_values=resolved_placeholder_values
             )
             # 若当前语言没有对应文本，则按需求回退到原始错误信息
             if not description:
