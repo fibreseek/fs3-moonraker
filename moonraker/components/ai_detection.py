@@ -462,6 +462,7 @@ class AIDetectionClient:
         self._read_task: Optional[asyncio.Task] = None              # 读取任务
         self._closing: bool = False                                 # 关闭标志  
         self._connection_mutex: asyncio.Lock = asyncio.Lock()       # 连接互斥锁
+        self._connection_error_notified: bool = False               # 当前断连周期是否已发送过连接错误通知
 
         # 请求管理
         self._pending_requests: Dict[str, asyncio.Future] = {}      # 待处理请求
@@ -606,6 +607,17 @@ class AIDetectionClient:
             notification_data
         )
 
+    def _notify_connection_error(self, message: str) -> None:
+        """发送 AI 服务连接类错误通知，供 error_indexer 统一索引。"""
+        if self._connection_error_notified:
+            return
+        self._connection_error_notified = True
+        self._send_detection_notification(
+            scenario=DetectionScenario.UNKNOWN,
+            detection_type="unknown",
+            message=message,
+        )
+
     async def _do_connect(self) -> bool:
         """执行 WebSocket 连接逻辑"""
         async with self._connection_mutex:
@@ -642,20 +654,32 @@ class AIDetectionClient:
                 logging.warning(
                     f"AI Detection: Connection to {ws_uri} timed out"
                 )
+                self._notify_connection_error(
+                    "AI Detection connection timeout"
+                )
             except ConnectionRefusedError:
                 self._stats["last_error"] = "Connection refused"
                 logging.warning(
                     f"AI Detection: Connection refused by {ws_uri}"
+                )
+                self._notify_connection_error(
+                    "AI Detection connection refused"
                 )
             except (InvalidURI, InvalidHandshake) as e:
                 self._stats["last_error"] = f"WebSocket handshake failed: {e}"
                 logging.warning(
                     f"AI Detection: WebSocket handshake failed: {e}"
                 )
+                self._notify_connection_error(
+                    "AI Detection websocket handshake failed"
+                )
             except Exception as e:
                 self._stats["last_error"] = str(e)
                 logging.exception(
                     f"AI Detection: Failed to connect to {ws_uri}"
+                )
+                self._notify_connection_error(
+                    "AI Detection websocket connection error"
                 )
 
             self._websocket = None
@@ -707,12 +731,21 @@ class AIDetectionClient:
             logging.warning(
                 f"AI Detection: WebSocket closed with error: {e.code} {e.reason}"
             )
+            self._notify_connection_error(
+                "AI Detection websocket read loop error"
+            )
         except ConnectionClosed as e:
             logging.info(f"AI Detection: WebSocket connection closed: {e}")
+            self._notify_connection_error(
+                "AI Detection websocket read loop error"
+            )
         except asyncio.CancelledError:
             pass
         except Exception as e:
             logging.exception(f"AI Detection: Read loop error: {e}")
+            self._notify_connection_error(
+                "AI Detection websocket read loop error"
+            )
         finally:
             if not self._closing:
                 await self._handle_disconnect()
@@ -787,6 +820,8 @@ class AIDetectionClient:
         if self._state != new_state:
             old_state = self._state
             self._state = new_state
+            if new_state == ConnectionState.CONNECTED:
+                self._connection_error_notified = False
             logging.debug(
                 f"AI Detection: State changed from {old_state.value} to {new_state.value}"
             )
