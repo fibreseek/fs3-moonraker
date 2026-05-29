@@ -310,10 +310,19 @@ class KlippyAPI(APITransport):
 
         print_stats = status.get("print_stats", {}) if isinstance(status, dict) else {}
         state = str(print_stats.get("state", "")).strip().lower()
-        if state != "standby":
-            msg = f"Printer state '{state or 'unknown'}' does not allow start_print"
-            logging.warning(msg)
-            raise self.server.error(msg, 409)
+        if state == "standby":
+            return
+        if state == "complete":
+            # 上一次打印已完成，将 print_stats.state 重置为 standby 后继续执行，不记录错误
+            logging.info("Printer state is 'complete', resetting print_stats.state to standby before start")
+            try:
+                await self.run_gcode("SET_PRINT_STATS_INFO STATE=standby")
+            except Exception as e:
+                logging.warning(f"Failed to reset print_stats.state to standby: {e}")
+            return
+        msg = f"Printer state '{state or 'unknown'}' does not allow start printing"
+        logging.warning(msg)
+        raise self.server.error(msg, 409)
 
     async def _run_precheck(
         self,
