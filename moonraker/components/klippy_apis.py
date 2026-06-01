@@ -312,11 +312,11 @@ class KlippyAPI(APITransport):
         state = str(print_stats.get("state", "")).strip().lower()
         if state == "standby":
             return
-        if state == "complete":
+        if state == "complete" or state == "cancelled":
             # 上一次打印已完成，将 print_stats.state 重置为 standby 后继续执行，不记录错误
-            logging.info("Printer state is 'complete', resetting print_stats.state to standby before start")
+            logging.info("Printer state is 'complete' or 'cancelled', resetting printer to standby before start")
             try:
-                await self.run_gcode("SET_PRINT_STATS_INFO STATE=standby")
+                await self.run_gcode("SET_PRINTER_STANDBY")
             except Exception as e:
                 logging.warning(f"Failed to reset print_stats.state to standby: {e}")
             return
