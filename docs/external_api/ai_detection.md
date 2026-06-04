@@ -334,10 +334,25 @@ Moonraker 在打印前会按下面顺序执行 AI 预检：
 
 ## 与打印启动接口的关系
 
-AI 是否参与打印前预检，不再通过 `printer.print.start` 的临时参数控制，而是由当前 AI 配置决定。
+AI 是否参与打印前预检，当前推荐由 AI 配置控制，而不是依赖
+`printer.print.start` 的临时参数。
 
 当前远程起打如果需要控制 AI，应使用：
 
 - `server.ai_detection.config`
 
 而不是在 `printer.print.start` 中传 AI 控制字段。
+
+为兼容旧客户端，`printer.print.start` 仍接受：
+
+- `skip_foreign_detect`
+
+其语义保持旧版本行为：
+
+- `skip_foreign_detect=true` 时，跳过 AI 预检
+- 跳过范围包括底板检测和异物检测
+- 耗材等其他预检仍继续执行
+
+如果需要跳过整个预检查流程，应继续使用：
+
+- `skip_precheck=true`

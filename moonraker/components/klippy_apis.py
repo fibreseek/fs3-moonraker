@@ -122,6 +122,10 @@ class KlippyAPI(APITransport):
         user = web_request.get_current_user()
         auto_leveling: bool = web_request.get_boolean('auto_leveling', False)
         timelapse: bool = web_request.get_boolean('timelapse', False)
+        # 兼容旧客户端：仅跳过 AI 预检，不影响耗材等其他预检
+        skip_foreign_detect: bool = web_request.get_boolean(
+            'skip_foreign_detect', False
+        )
         # 是否跳过整个预检查流程（包括 AI、传感器等），主要用于用户确认后“忽略并继续”
         skip_precheck: bool = web_request.get_boolean('skip_precheck', False)
 
@@ -158,6 +162,7 @@ class KlippyAPI(APITransport):
             user=user,
             auto_leveling=auto_leveling,
             timelapse=timelapse,
+            skip_foreign_detect=skip_foreign_detect,
             skip_precheck=skip_precheck,
         )
 
@@ -199,6 +204,7 @@ class KlippyAPI(APITransport):
         user: Optional[UserInfo] = None,
         auto_leveling: bool = False,
         timelapse: bool = False,
+        skip_foreign_detect: bool = False,
         skip_precheck: bool = False,
     ) -> str:
         # WARNING: Do not call this method from within the following
@@ -276,6 +282,7 @@ class KlippyAPI(APITransport):
         # 打印前预检查（AI / 传感器等）
         if not skip_precheck:
             await self._run_precheck(
+                skip_foreign_detect=skip_foreign_detect,
                 print_mode=print_mode,
                 chamber_temp=chamber_temp,
             )
@@ -322,6 +329,7 @@ class KlippyAPI(APITransport):
 
     async def _run_precheck(
         self,
+        skip_foreign_detect: bool = False,
         print_mode: int = -1,
         chamber_temp: float = 0.0,
     ) -> None:
@@ -342,6 +350,8 @@ class KlippyAPI(APITransport):
         - Klipper 状态: objects/query 或 notify_status_update 中 print_stats.state
           可为 "precheck"，表示处于预检查阶段；预检查通过并下发 SDCARD_PRINT_FILE 后
           会变为 "printing"。
+        - 兼容旧客户端: POST /printer/print/start 传 skip_foreign_detect=true
+          可跳过 AI 预检（底板检测 + 异物检测），但不会跳过耗材等其他预检。
         - 忽略并继续: POST /printer/print/start 传 skip_precheck=true 可跳过
           整个预检查流程后继续打印。
         """
@@ -354,37 +364,44 @@ class KlippyAPI(APITransport):
         try:
             # 1. 打印前 AI 检测：先底板，再异物检测
             try:
-                # 检查组件是否加载失败
-                if "ai_detection" in self.server.failed_components:
-                    msg = ("AI Detection component failed to load")
-                    self.server.send_event(
-                        "precheck:failed",
-                        {"message": msg, "step": "ai_detection", "http_code": 503},
+                if skip_foreign_detect:
+                    logging.info(
+                        "AI Detection: skipping AI precheck due to "
+                        "skip_foreign_detect compatibility flag"
                     )
-                    raise self.server.error(msg, 503)
-                ai_detection = self.server.lookup_component("ai_detection")
-                if not ai_detection.is_enabled():
-                    logging.info("AI Detection: Coordinator disabled, skipping AI precheck")
                 else:
-                    if ai_detection.is_floor_detect_enabled():
-                        floor_result = await ai_detection.detect_floor()
-                        if floor_result == "error":
-                            msg = ("AI Detection: Build plate check failed, skipping print")
-                            logging.warning(msg)
-                            raise self.server.error(msg, 403)
-                        logging.info("AI Detection: Build plate detected, proceeding to object detection")
-                    else:
-                        logging.info("AI Detection: Floor detection disabled, skipping...")
+                    # 检查组件是否加载失败
+                    if "ai_detection" in self.server.failed_components:
+                        msg = ("AI Detection component failed to load")
+                        self.server.send_event(
+                            "precheck:failed",
+                            {"message": msg, "step": "ai_detection", "http_code": 503},
+                        )
+                        raise self.server.error(msg, 503)
 
-                    if ai_detection.is_object_detect_enabled():
-                        object_result = await ai_detection.detect_object()
-                        if object_result == "error":
-                            msg = ("AI Detection: Object detection failed, skipping print")
-                            logging.warning(msg)
-                            raise self.server.error(msg, 403)
-                        logging.info("AI Detection: No objects detected, proceeding with print")
+                    ai_detection = self.server.lookup_component("ai_detection")
+                    if not ai_detection.is_enabled():
+                        logging.info("AI Detection: Coordinator disabled, skipping AI precheck")
                     else:
-                        logging.info("AI Detection: Object detection disabled, skipping...")
+                        if ai_detection.is_floor_detect_enabled():
+                            floor_result = await ai_detection.detect_floor()
+                            if floor_result == "error":
+                                msg = ("AI Detection: Build plate check failed, skipping print")
+                                logging.warning(msg)
+                                raise self.server.error(msg, 403)
+                            logging.info("AI Detection: Build plate detected, proceeding to object detection")
+                        else:
+                            logging.info("AI Detection: Floor detection disabled, skipping...")
+
+                        if ai_detection.is_object_detect_enabled():
+                            object_result = await ai_detection.detect_object()
+                            if object_result == "error":
+                                msg = ("AI Detection: Object detection failed, skipping print")
+                                logging.warning(msg)
+                                raise self.server.error(msg, 403)
+                            logging.info("AI Detection: No objects detected, proceeding with print")
+                        else:
+                            logging.info("AI Detection: Object detection disabled, skipping...")
             except self.server.error:
                 raise
             except Exception as e:
