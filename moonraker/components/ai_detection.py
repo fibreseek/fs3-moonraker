@@ -36,14 +36,15 @@ if TYPE_CHECKING:
 
 class DetectionType(str, Enum):
     """AI 检测类型枚举"""
+    FLOOR_DETECT = "floor_detect"  # 底板检测
+    OBJECT_DETECT = "object_detect"  # 打印前异物/手部/底板异常检测
     DEFECT_DETECT = "defect_detect"  # 缺陷检测
-    FOREIGN_OBJECT_DETECT = "preprint_object_detect"  # 平台异物检测
 
 
 class DetectionScenario(str, Enum):
     """AI 检测场景枚举"""
-    # 打印前异物检测
-    PREPRINT_FOREIGN_OBJECT = "preprint_foreign_object"
+    PREPRINT_FLOOR = "preprint_floor"
+    PREPRINT_OBJECT = "preprint_object"
     # 打印中缺陷检测（定时）
     PRINTING_DEFECT_PERIODIC = "printing_defect_periodic"
     # 打印中缺陷检测（手动）
@@ -69,18 +70,18 @@ class ClassMappingRegistry:
         2: ClassMapping("stringing", "Stringing"),
     }
 
-    # Default foreign object detection class mappings
-    DEFAULT_FOREIGN_CLASSES: Dict[int, ClassMapping] = {
+    # Default object detection class mappings
+    DEFAULT_OBJECT_CLASSES: Dict[int, ClassMapping] = {
         0: ClassMapping("object", "Foreign object on bed"),
-        1: ClassMapping("object", "Foreign object on bed"),
-        2: ClassMapping("hand", "Hand detected"),
+        1: ClassMapping("hand", "Hand detected"),
+        2: ClassMapping("floor", "Build plate anomaly"),
     }
 
     def __init__(self) -> None:
         self.defect_classes: Dict[int, ClassMapping] = dict(
             self.DEFAULT_DEFECT_CLASSES)
-        self.foreign_classes: Dict[int, ClassMapping] = dict(
-            self.DEFAULT_FOREIGN_CLASSES)
+        self.object_classes: Dict[int, ClassMapping] = dict(
+            self.DEFAULT_OBJECT_CLASSES)
 
     def load_from_config(self, config: "ConfigHelper") -> None:
         """从配置文件加载类别映射
@@ -88,14 +89,14 @@ class ClassMappingRegistry:
         配置格式示例:
             defect_class_0: spaghetti, 炒面/意大利面状缺陷
             defect_class_1: zits, 疙瘩/斑点
-            foreign_class_0: object, 底板异物
+            object_class_0: object, 底板异物
         """
         # 加载缺陷检测类别
         self._load_class_mappings(config, "defect_class_", self.defect_classes)
 
-        # 加载平台异物检测类别
+        # 加载打印前异物检测类别
         self._load_class_mappings(
-            config, "foreign_class_", self.foreign_classes)
+            config, "object_class_", self.object_classes)
 
     def _load_class_mappings(
         self,
@@ -142,16 +143,16 @@ class ClassMappingRegistry:
             return self.defect_classes[class_id].description
         return f"unknown_{class_id}"
 
-    def get_foreign_name(self, class_id: int) -> str:
-        """获取平台异物类别名称"""
-        if class_id in self.foreign_classes:
-            return self.foreign_classes[class_id].name
+    def get_object_name(self, class_id: int) -> str:
+        """获取打印前物体检测类别名称"""
+        if class_id in self.object_classes:
+            return self.object_classes[class_id].name
         return f"unknown_{class_id}"
 
-    def get_foreign_description(self, class_id: int) -> str:
-        """获取平台异物类别描述"""
-        if class_id in self.foreign_classes:
-            return self.foreign_classes[class_id].description
+    def get_object_description(self, class_id: int) -> str:
+        """获取打印前物体检测类别描述"""
+        if class_id in self.object_classes:
+            return self.object_classes[class_id].description
         return f"unknown_{class_id}"
 
     def get_all_mappings(self) -> Dict[str, Any]:
@@ -161,9 +162,9 @@ class ClassMappingRegistry:
                 class_id: {"name": m.name, "description": m.description}
                 for class_id, m in self.defect_classes.items()
             },
-            "foreign_classes": {
+            "object_classes": {
                 class_id: {"name": m.name, "description": m.description}
-                for class_id, m in self.foreign_classes.items()
+                for class_id, m in self.object_classes.items()
             }
         }
 
@@ -191,16 +192,18 @@ class ConnectionState(str, Enum):
 @dataclass
 class DetectionParams:
     """检测参数数据类"""
-    obj_thresh: float = 0.35  # 目标检出的阈值
+    obj_thresh: Union[float, Dict[str, float]] = 0.35  # 目标检出的阈值
     nms_thresh: float = 0.45  # 检测框的阈值
-    is_lite: bool = False     # 是否使用lite模型（仅缺陷检测有效）
+    is_lite: Optional[bool] = None  # 是否使用lite模型（仅缺陷检测有效）
 
-    def to_dict(self) -> Dict[str, Union[float, bool]]:
-        return {
+    def to_dict(self) -> Dict[str, Union[float, Dict[str, float], bool]]:
+        data: Dict[str, Union[float, Dict[str, float], bool]] = {
             "obj_thresh": self.obj_thresh,
             "nms_thresh": self.nms_thresh,
-            "is_lite": self.is_lite
         }
+        if self.is_lite is not None:
+            data["is_lite"] = self.is_lite
+        return data
 
 
 # 上位机三档灵敏度：对应下发给 AI 服务的 obj_thresh（置信度门槛）
@@ -215,6 +218,8 @@ _SENSITIVITY_LABEL_TO_KEY: Dict[str, str] = {
     "medium": "medium",
     "low": "low",
 }
+_OBJECT_CLASS_IDS = ("0", "1", "2")
+_DEFECT_CLASS_IDS = ("0", "1", "2")
 
 
 def _canonical_sensitivity_key(value: str) -> str:
@@ -223,6 +228,10 @@ def _canonical_sensitivity_key(value: str) -> str:
     if key in _SENSITIVITY_LABEL_TO_KEY:
         return _SENSITIVITY_LABEL_TO_KEY[key]
     raise ValueError(f"invalid sensitivity label: {value!r}")
+
+
+def _expand_threshold(threshold: float, class_ids: tuple[str, ...]) -> Dict[str, float]:
+    return {class_id: threshold for class_id in class_ids}
 
 
 @dataclass
@@ -306,38 +315,32 @@ class DefectDetectionResult:
 
 
 @dataclass
-class ForeignDetectionResult:
-    """平台异物检测结果数据类
-
-    异物类别由配置文件定义，默认:
-        0/1 - 底板上的异物
-        2   - 未检测到打印底板（或相关场景）
-    """
+class ObjectDetectionResult:
+    """打印前物体检测结果数据类"""
     is_valid: bool
     has_object: bool = False  # 是否有异物
     scores: List[float] = field(default_factory=list)  # 置信度
     boxes: List[List[float]] = field(default_factory=list)  # 异物目标框
     classes: List[int] = field(default_factory=list)  # 异物所属类别
-    no_build_plate: bool = False  # 是否未检测到打印底板
+    build_plate_issue: bool = False  # 是否检测到底板异常
 
     @property
     def class_names(self) -> List[str]:
         """获取类别名称列表"""
         registry = get_class_registry()
-        return [registry.get_foreign_name(c) for c in self.classes]
+        return [registry.get_object_name(c) for c in self.classes]
 
     @classmethod
-    def from_dict(cls, data: Dict[str, Any]) -> "ForeignDetectionResult":
+    def from_dict(cls, data: Dict[str, Any]) -> "ObjectDetectionResult":
         classes: List[int] = data.get("classes", []) or []
-        # 约定: 类别 ID 为 2 表示未检测到打印底板
-        no_build_plate = 2 in classes
+        build_plate_issue = 2 in classes
         return cls(
             is_valid=data.get("is_valid", False),
             has_object=data.get("has_object", False),
             scores=data.get("scores", []),
             boxes=data.get("boxes", []),
             classes=classes,
-            no_build_plate=no_build_plate,
+            build_plate_issue=build_plate_issue,
         )
 
     def to_dict(self) -> Dict[str, Any]:
@@ -348,8 +351,39 @@ class ForeignDetectionResult:
             "scores": self.scores,
             "boxes": self.boxes,
             "classes": self.classes,
-            "class_names": [registry.get_foreign_name(c) for c in self.classes],
-            "no_build_plate": self.no_build_plate,
+            "class_names": [registry.get_object_name(c) for c in self.classes],
+            "build_plate_issue": self.build_plate_issue,
+        }
+
+
+@dataclass
+class FloorDetectionResult:
+    """打印前底板检测结果数据类"""
+    is_valid: bool
+    has_build_plate: bool = False
+    scores: List[float] = field(default_factory=list)
+    boxes: List[List[float]] = field(default_factory=list)
+    classes: List[int] = field(default_factory=list)
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "FloorDetectionResult":
+        classes: List[int] = data.get("classes", []) or []
+        has_build_plate = bool(data.get("has_object", False) or 2 in classes)
+        return cls(
+            is_valid=data.get("is_valid", False),
+            has_build_plate=has_build_plate,
+            scores=data.get("scores", []),
+            boxes=data.get("boxes", []),
+            classes=classes,
+        )
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "is_valid": self.is_valid,
+            "has_build_plate": self.has_build_plate,
+            "scores": self.scores,
+            "boxes": self.boxes,
+            "classes": self.classes,
         }
 
 
@@ -360,25 +394,23 @@ class CoordinatorConfig:
     enable: bool = True
 
     # 检测开关
-    enable_foreign_detect: bool = True
+    enable_floor_detect: bool = True
+    enable_object_detect: bool = True
     enable_defect_detect: bool = True
 
     # 检测间隔（秒）
     detect_interval: float = 10.0
 
-    # 自动暂停配置
-    auto_pause_on_defect: bool = True
-    auto_pause_on_spaghetti: bool = True
-    auto_pause_on_zits: bool = False
-    auto_pause_on_stringing: bool = False
-
     @classmethod
     def from_config(cls, config: "ConfigHelper") -> "CoordinatorConfig":
         """从配置文件加载配置"""
         return cls(
-            enable=config.getboolean("enable", False),
-            enable_foreign_detect=config.getboolean(
-                "enable_foreign_detect", True
+            enable=config.getboolean("enable", True),
+            enable_floor_detect=config.getboolean(
+                "enable_floor_detect", True
+            ),
+            enable_object_detect=config.getboolean(
+                "enable_object_detect", True
             ),
             enable_defect_detect=config.getboolean(
                 "enable_defect_detect", True
@@ -386,31 +418,16 @@ class CoordinatorConfig:
             detect_interval=config.getfloat(
                 "detect_interval", 10.0, minval=1.0
             ),
-            auto_pause_on_defect=config.getboolean(
-                "auto_pause_on_defect", True
-            ),
-            auto_pause_on_spaghetti=config.getboolean(
-                "auto_pause_on_spaghetti", True
-            ),
-            auto_pause_on_zits=config.getboolean(
-                "auto_pause_on_zits", False
-            ),
-            auto_pause_on_stringing=config.getboolean(
-                "auto_pause_on_stringing", False
-            ),
         )
 
     def to_dict(self) -> Dict[str, Any]:
         """转换为字典"""
         return {
             "enable": self.enable,
-            "enable_foreign_detect": self.enable_foreign_detect,
+            "enable_floor_detect": self.enable_floor_detect,
+            "enable_object_detect": self.enable_object_detect,
             "enable_defect_detect": self.enable_defect_detect,
             "detect_interval": self.detect_interval,
-            "auto_pause_on_defect": self.auto_pause_on_defect,
-            "auto_pause_on_spaghetti": self.auto_pause_on_spaghetti,
-            "auto_pause_on_zits": self.auto_pause_on_zits,
-            "auto_pause_on_stringing": self.auto_pause_on_stringing,
         }
 
     def update(self, **kwargs) -> None:
@@ -445,15 +462,17 @@ class AIDetectionClient:
         )
         self.auto_connect: bool = config.getboolean("auto_connect", True)
 
-        # 检测参数
-        self.obj_thresh: float = config.getfloat(
-            "default_obj_thresh", 0.35, minval=0.0, maxval=1.0
+        # 运行时检测参数
+        self.nms_thresh: float = 0.45
+        self.floor_sensitivity: str = _canonical_sensitivity_key(
+            config.get("floor_sensitivity", "medium")
         )
-        self.nms_thresh: float = config.getfloat(
-            "default_nms_thresh", 0.45, minval=0.0, maxval=1.0
+        self.object_sensitivity: str = _canonical_sensitivity_key(
+            config.get("object_sensitivity", "medium")
         )
-        # 三档灵敏度（high/medium/low）；None 表示走 default_obj_thresh / 数值调参流程
-        self.sensitivity: Optional[str] = None
+        self.defect_sensitivity: str = _canonical_sensitivity_key(
+            config.get("defect_sensitivity", "medium")
+        )
 
         # 连接状态
         self._state: ConnectionState = ConnectionState.DISCONNECTED # 初始状态
@@ -462,6 +481,7 @@ class AIDetectionClient:
         self._read_task: Optional[asyncio.Task] = None              # 读取任务
         self._closing: bool = False                                 # 关闭标志  
         self._connection_mutex: asyncio.Lock = asyncio.Lock()       # 连接互斥锁
+        self._connection_error_notified: bool = False               # 当前断连周期是否已发送过连接错误通知
 
         # 请求管理
         self._pending_requests: Dict[str, asyncio.Future] = {}      # 待处理请求
@@ -537,21 +557,40 @@ class AIDetectionClient:
         timestamp = int(time.time() * 1000)
         return f"{detection_type.value}_{self._request_counter}_{timestamp}"
 
-    def _effective_obj_thresh(self, override: Optional[float]) -> float:
-        """显式参数 > 灵敏度档位 > self.obj_thresh"""
+    def _resolve_threshold(self, override: Optional[float], sensitivity: str) -> float:
         if override is not None:
             return float(override)
-        if self.sensitivity is not None:
-            return SENSITIVITY_OBJ_THRESH[self.sensitivity]
-        return self.obj_thresh
+        return SENSITIVITY_OBJ_THRESH[sensitivity]
+
+    def _effective_floor_obj_thresh(self, override: Optional[float] = None) -> float:
+        return self._resolve_threshold(override, self.floor_sensitivity)
+
+    def _effective_object_obj_thresh(
+        self, override: Optional[float] = None
+    ) -> Dict[str, float]:
+        threshold = self._resolve_threshold(override, self.object_sensitivity)
+        return _expand_threshold(threshold, _OBJECT_CLASS_IDS)
+
+    def _effective_defect_obj_thresh(
+        self, override: Optional[float] = None
+    ) -> Dict[str, float]:
+        threshold = self._resolve_threshold(override, self.defect_sensitivity)
+        return _expand_threshold(threshold, _DEFECT_CLASS_IDS)
+
+    def _effective_thresholds(self) -> Dict[str, Any]:
+        return {
+            "floor_detect": self._effective_floor_obj_thresh(),
+            "object_detect": self._effective_object_obj_thresh(),
+            "defect_detect": self._effective_defect_obj_thresh(),
+        }
 
     def _config_notification_payload(self) -> Dict[str, Any]:
         return {
             **self.coordinator_config.to_dict(),
-            "obj_thresh": self.obj_thresh,
-            "nms_thresh": self.nms_thresh,
-            "sensitivity": self.sensitivity,
-            "effective_obj_thresh": self._effective_obj_thresh(None),
+            "floor_sensitivity": self.floor_sensitivity,
+            "object_sensitivity": self.object_sensitivity,
+            "defect_sensitivity": self.defect_sensitivity,
+            "effective_thresholds": self._effective_thresholds(),
         }
 
     async def component_init(self) -> None:
@@ -567,11 +606,19 @@ class AIDetectionClient:
         """检查 AI 检测总开关是否启用（不考虑连接状态）"""
         return self.coordinator_config.enable
 
-    def is_foreign_detect_enabled(self) -> bool:
-        """检查是否启用异物检测"""
+    def is_floor_detect_enabled(self) -> bool:
+        """检查是否启用底板检测"""
         return (
             self.coordinator_config.enable
-            and self.coordinator_config.enable_foreign_detect
+            and self.coordinator_config.enable_floor_detect
+            and self.is_connected
+        )
+
+    def is_object_detect_enabled(self) -> bool:
+        """检查是否启用打印前物体检测"""
+        return (
+            self.coordinator_config.enable
+            and self.coordinator_config.enable_object_detect
             and self.is_connected
         )
 
@@ -604,6 +651,17 @@ class AIDetectionClient:
         self.server.send_event(
             "ai_detection:detection_result",
             notification_data
+        )
+
+    def _notify_connection_error(self, message: str) -> None:
+        """发送 AI 服务连接类错误通知，供 error_indexer 统一索引。"""
+        if self._connection_error_notified:
+            return
+        self._connection_error_notified = True
+        self._send_detection_notification(
+            scenario=DetectionScenario.UNKNOWN,
+            detection_type="unknown",
+            message=message,
         )
 
     async def _do_connect(self) -> bool:
@@ -642,20 +700,32 @@ class AIDetectionClient:
                 logging.warning(
                     f"AI Detection: Connection to {ws_uri} timed out"
                 )
+                self._notify_connection_error(
+                    "AI Detection connection timeout"
+                )
             except ConnectionRefusedError:
                 self._stats["last_error"] = "Connection refused"
                 logging.warning(
                     f"AI Detection: Connection refused by {ws_uri}"
+                )
+                self._notify_connection_error(
+                    "AI Detection connection refused"
                 )
             except (InvalidURI, InvalidHandshake) as e:
                 self._stats["last_error"] = f"WebSocket handshake failed: {e}"
                 logging.warning(
                     f"AI Detection: WebSocket handshake failed: {e}"
                 )
+                self._notify_connection_error(
+                    "AI Detection websocket handshake failed"
+                )
             except Exception as e:
                 self._stats["last_error"] = str(e)
                 logging.exception(
                     f"AI Detection: Failed to connect to {ws_uri}"
+                )
+                self._notify_connection_error(
+                    "AI Detection websocket connection error"
                 )
 
             self._websocket = None
@@ -707,12 +777,21 @@ class AIDetectionClient:
             logging.warning(
                 f"AI Detection: WebSocket closed with error: {e.code} {e.reason}"
             )
+            self._notify_connection_error(
+                "AI Detection websocket read loop error"
+            )
         except ConnectionClosed as e:
             logging.info(f"AI Detection: WebSocket connection closed: {e}")
+            self._notify_connection_error(
+                "AI Detection websocket read loop error"
+            )
         except asyncio.CancelledError:
             pass
         except Exception as e:
             logging.exception(f"AI Detection: Read loop error: {e}")
+            self._notify_connection_error(
+                "AI Detection websocket read loop error"
+            )
         finally:
             if not self._closing:
                 await self._handle_disconnect()
@@ -733,10 +812,12 @@ class AIDetectionClient:
 
                     # 根据 request_id 粗略推断检测类型，用于统一错误通知
                     detection_type = "unknown"
+                    if request_id.startswith(DetectionType.FLOOR_DETECT.value):
+                        detection_type = "floor"
+                    elif request_id.startswith(DetectionType.OBJECT_DETECT.value):
+                        detection_type = "object"
                     if request_id.startswith(DetectionType.DEFECT_DETECT.value):
                         detection_type = "defect"
-                    elif request_id.startswith(DetectionType.FOREIGN_OBJECT_DETECT.value):
-                        detection_type = "foreign_object"
 
                     # 通过 ai_detection:detection_result 推送错误信息，
                     # 由 error_indexer 组件进行统一检索和上报
@@ -787,6 +868,8 @@ class AIDetectionClient:
         if self._state != new_state:
             old_state = self._state
             self._state = new_state
+            if new_state == ConnectionState.CONNECTED:
+                self._connection_error_notified = False
             logging.debug(
                 f"AI Detection: State changed from {old_state.value} to {new_state.value}"
             )
@@ -852,8 +935,7 @@ class AIDetectionClient:
         obj_thresh: Optional[float] = None,
         nms_thresh: Optional[float] = None,
         is_lite: bool = False,
-        scenario: DetectionScenario = DetectionScenario.PRINTING_DEFECT_MANUAL,
-        send_notification: bool = True
+        scenario: DetectionScenario = DetectionScenario.PRINTING_DEFECT_MANUAL
     ) -> DefectDetectionResult:
         """执行打印缺陷检测
 
@@ -862,7 +944,6 @@ class AIDetectionClient:
             nms_thresh: NMS阈值
             is_lite: 是否使用lite模型
             scenario: 检测场景
-            send_notification: 是否发送通知
 
         Returns:
             DefectDetectionResult: 缺陷检测结果
@@ -871,7 +952,7 @@ class AIDetectionClient:
             return DefectDetectionResult(is_valid=False, warning=False)
 
         params = DetectionParams(
-            obj_thresh=self._effective_obj_thresh(obj_thresh),
+            obj_thresh=self._effective_defect_obj_thresh(obj_thresh),
             nms_thresh=nms_thresh if nms_thresh is not None else self.nms_thresh,
             is_lite=is_lite
         )
@@ -888,83 +969,101 @@ class AIDetectionClient:
 
         return result
 
-    async def detect_foreign_object(
+    async def detect_floor(
         self,
         obj_thresh: Optional[float] = None,
         nms_thresh: Optional[float] = None,
-        scenario: DetectionScenario = DetectionScenario.PREPRINT_FOREIGN_OBJECT,
-        send_notification: bool = True
+        scenario: DetectionScenario = DetectionScenario.PREPRINT_FLOOR
     ) -> str:
-        """执行打印前平台异物检测
-
-        Args:
-            obj_thresh: 检测阈值
-            nms_thresh: NMS阈值
-            scenario: 检测场景
-            send_notification: 是否发送通知
-
-        Returns:
-            str: 异物检测结果 ok 或 error
-        """
+        """执行打印前底板检测"""
         if not self.is_connected:
             msg = "AI Detection service is not connected"
             self._send_detection_notification(
-                scenario=DetectionScenario.PREPRINT_FOREIGN_OBJECT,
-                detection_type="foreign_object",
+                scenario=scenario,
+                detection_type="floor",
                 message=msg
             )
             return "error"
-        # AI 检测是否启用
-        if not self.is_enabled():
-            logging.info("AI Detection is disabled, skipping foreign object detection")
+        if not self.coordinator_config.enable or not self.coordinator_config.enable_floor_detect:
+            logging.info("AI Detection is disabled, skipping floor detection")
             return "ok"
 
         params = DetectionParams(
-            obj_thresh=self._effective_obj_thresh(obj_thresh),
+            obj_thresh=self._effective_floor_obj_thresh(obj_thresh),
+            nms_thresh=nms_thresh if nms_thresh is not None else self.nms_thresh
+        )
+        result_data = await self._send_request(DetectionType.FLOOR_DETECT, params)
+        result = FloorDetectionResult.from_dict(result_data)
+        if result.has_build_plate:
+            logging.info("AI Detection: Build plate detected")
+            return "ok"
+
+        msg = "AI Detection: Build plate not detected"
+        logging.warning(msg)
+        self._send_detection_notification(
+            scenario=scenario,
+            detection_type="floor",
+            message=msg
+        )
+        return "error"
+
+    async def detect_object(
+        self,
+        obj_thresh: Optional[float] = None,
+        nms_thresh: Optional[float] = None,
+        scenario: DetectionScenario = DetectionScenario.PREPRINT_OBJECT
+    ) -> str:
+        """执行打印前异物/手部/底板异常检测"""
+        if not self.is_connected:
+            msg = "AI Detection service is not connected"
+            self._send_detection_notification(
+                scenario=scenario,
+                detection_type="object",
+                message=msg
+            )
+            return "error"
+        if not self.coordinator_config.enable or not self.coordinator_config.enable_object_detect:
+            logging.info("AI Detection is disabled, skipping object detection")
+            return "ok"
+
+        params = DetectionParams(
+            obj_thresh=self._effective_object_obj_thresh(obj_thresh),
             nms_thresh=nms_thresh if nms_thresh is not None else self.nms_thresh
         )
 
-        result_data = await self._send_request(
-            DetectionType.FOREIGN_OBJECT_DETECT, params
-        )
-        result = ForeignDetectionResult.from_dict(result_data)
+        result_data = await self._send_request(DetectionType.OBJECT_DETECT, params)
+        result = ObjectDetectionResult.from_dict(result_data)
 
         logging.warning(
-            f"AI Detection: Foreign object detected - "
+            f"AI Detection: Object detection result - "
             f"Class: {result.classes}, Box: {result.boxes}, "
             f"Score: {result.scores}"
         )
 
-        # 1.1 平台异物检查结果
-        if result.is_valid:
-            if result.has_object:
-                if result.no_build_plate:
-                    msg = ("AI Detection: Build plate not detected")
-                    logging.warning(msg)
-                    self._send_detection_notification(
-                        scenario=DetectionScenario.PREPRINT_FOREIGN_OBJECT,
-                        detection_type="foreign_object",
-                        message=msg
-                    )
-                    return "error"
-                else:
-                    msg = ("AI Detection: Foreign object detected")
-                    logging.warning(msg)
-                    self._send_detection_notification(
-                        scenario=DetectionScenario.PREPRINT_FOREIGN_OBJECT,
-                        detection_type="foreign_object",
-                        message=msg
-                    )
-                    return "error"
-            else:
-                logging.info("AI Detection: No foreign objects detected")
-                return "ok"
-        else:
-            # 未检测到异物，继续打印
-            msg = (
-                "AI Detection: No foreign objects detected"
+        if result.build_plate_issue:
+            msg = "AI Detection: Build plate not detected"
+            logging.warning(msg)
+            self._send_detection_notification(
+                scenario=scenario,
+                detection_type="object",
+                message=msg
             )
-            logging.info(msg)
+            return "error"
+
+        if result.is_valid and result.has_object:
+            if 1 in result.classes:
+                msg = "AI Detection: Hand detected"
+            else:
+                msg = "AI Detection: Foreign object detected"
+            logging.warning(msg)
+            self._send_detection_notification(
+                scenario=scenario,
+                detection_type="object",
+                message=msg
+            )
+            return "error"
+
+        logging.info("AI Detection: No objects detected")
 
         return "ok"
 
@@ -1037,24 +1136,17 @@ class AIDetectionClient:
             "stats": dict(self._stats),
             # 配置（合并客户端配置和协调器配置）
             "config": {
-                # 客户端连接配置
-                "reconnect_interval": self.reconnect_interval,
-                "request_timeout": self.request_timeout,
-                "auto_connect": self.auto_connect,
                 # AI检测配置
-                "obj_thresh": self.obj_thresh,
-                "nms_thresh": self.nms_thresh,
-                "sensitivity": self.sensitivity,
-                "effective_obj_thresh": self._effective_obj_thresh(None),
+                "floor_sensitivity": self.floor_sensitivity,
+                "object_sensitivity": self.object_sensitivity,
+                "defect_sensitivity": self.defect_sensitivity,
+                "effective_thresholds": self._effective_thresholds(),
                 # 协调器配置
                 "enable": self.coordinator_config.enable,
-                "enable_foreign_detect": self.coordinator_config.enable_foreign_detect,
+                "enable_floor_detect": self.coordinator_config.enable_floor_detect,
+                "enable_object_detect": self.coordinator_config.enable_object_detect,
                 "enable_defect_detect": self.coordinator_config.enable_defect_detect,
                 "detect_interval": self.coordinator_config.detect_interval,
-                "auto_pause_on_defect": self.coordinator_config.auto_pause_on_defect,
-                "auto_pause_on_spaghetti": self.coordinator_config.auto_pause_on_spaghetti,
-                "auto_pause_on_zits": self.coordinator_config.auto_pause_on_zits,
-                "auto_pause_on_stringing": self.coordinator_config.auto_pause_on_stringing,
             },
             "class_mappings": self.class_registry.get_all_mappings(),
             # 协调器状态
@@ -1070,21 +1162,7 @@ class AIDetectionClient:
     async def _handle_config_update_request(
         self, web_request: WebRequest
     ) -> Dict[str, Any]:
-        """统一处理AI检测配置更新
-
-        支持的配置项：
-        - obj_thresh: 检测阈值 (0.0-1.0)
-        - nms_thresh: NMS阈值 (0.0-1.0)
-        - enable: AI总开关
-        - enable_foreign_detect: 异物检测开关
-        - enable_defect_detect: 缺陷检测开关
-        - detect_interval: 检测间隔(秒)
-        - auto_pause_on_defect: 缺陷时自动暂停
-        - auto_pause_on_spaghetti: 意面效应时自动暂停
-        - auto_pause_on_zits: 疙瘩时自动暂停
-        - auto_pause_on_stringing: 拉丝时自动暂停
-        - sensitivity: 三档灵敏度 high|medium|low（英文，大小写不敏感）；null 清除并恢复数值阈值模式
-        """
+        """统一处理AI检测配置更新。"""
         params = web_request.get_args() or {}
 
         if not isinstance(params, dict):
@@ -1093,136 +1171,106 @@ class AIDetectionClient:
         if not params:
             raise self.server.error("No configuration parameters provided", 400)
 
-        result = {}
-        updated = False
-        coordinator_updated = False  # 标记 coordinator 配置是否更新
-        thresh_updates: Dict[str, Any] = {}  # 阈值更新字典，用于持久化
-        sensitivity_in_request = False
-
-        def _validate_thresh(name: str, value: Any) -> float:
-            if not isinstance(value, (int, float)):
-                raise self.server.error(f"{name} must be a number", 400)
-            val = float(value)
-            if not (0.0 <= val <= 1.0):
-                raise self.server.error(f"{name} must be between 0.0 and 1.0", 400)
-            return val
-
-        if "obj_thresh" in params:
-            # 显式数值阈值优先：退出灵敏度档位模式
-            self.sensitivity = None
-            try:
-                await self.database.delete_item(
-                    "ai_detection", "default_sensitivity"
-                )
-            except Exception:
-                pass
-            self.obj_thresh = _validate_thresh("obj_thresh", params["obj_thresh"])
-            result["obj_thresh"] = self.obj_thresh
-            thresh_updates["default_obj_thresh"] = self.obj_thresh
-            updated = True
-
-        if "nms_thresh" in params:
-            self.nms_thresh = _validate_thresh("nms_thresh", params["nms_thresh"])
-            result["nms_thresh"] = self.nms_thresh
-            thresh_updates["default_nms_thresh"] = self.nms_thresh
-            updated = True
-
-        if "sensitivity" in params and "obj_thresh" not in params:
-            sensitivity_in_request = True
-            sraw = params["sensitivity"]
-            if sraw is None:
-                self.sensitivity = None
-                try:
-                    await self.database.delete_item(
-                        "ai_detection", "default_sensitivity"
-                    )
-                except Exception:
-                    pass
-            else:
-                if not isinstance(sraw, str):
-                    raise self.server.error(
-                        "sensitivity must be a string or null", 400
-                    )
-                try:
-                    canon = _canonical_sensitivity_key(sraw)
-                except ValueError:
-                    raise self.server.error(
-                        "sensitivity must be high, medium, or low", 400
-                    )
-                self.sensitivity = canon
-                await self.database.insert_item(
-                    "ai_detection", "default_sensitivity", canon
-                )
-            updated = True
-
-        # 处理 coordinator 配置
-        coordinator_params = {
-            k: v for k, v in params.items()
-            if k in [
-                "enable",
-                "enable_foreign_detect",
-                "enable_defect_detect",
-                "detect_interval",
-                "auto_pause_on_defect",
-                "auto_pause_on_spaghetti",
-                "auto_pause_on_zits",
-                "auto_pause_on_stringing",
-            ]
+        allowed_keys = {
+            "enable",
+            "enable_floor_detect",
+            "enable_object_detect",
+            "enable_defect_detect",
+            "floor_sensitivity",
+            "object_sensitivity",
+            "defect_sensitivity",
+            "detect_interval",
         }
-        if coordinator_params:
-            coordinator_result = self._update_coordinator_config(**coordinator_params)
-            result.update(coordinator_result)
-            updated = True
-            coordinator_updated = True
-
-        if not updated:
-            raise self.server.error("No valid configuration parameters provided", 400)
-
-        result["sensitivity"] = self.sensitivity
-        result["effective_obj_thresh"] = self._effective_obj_thresh(None)
-
-        if updated and thresh_updates:
-            await self._persist_config(thresh_updates)
-
-        # 未改协调器时由本处发通知；协调器更新时由 _update_coordinator_config 发送（含灵敏度字段）
-        if updated and not coordinator_updated and (
-            thresh_updates or sensitivity_in_request
-        ):
-            self.server.send_event(
-                "ai_detection:config_updated",
-                self._config_notification_payload(),
+        invalid_keys = sorted(set(params.keys()) - allowed_keys)
+        if invalid_keys:
+            raise self.server.error(
+                f"Unsupported configuration fields: {', '.join(invalid_keys)}", 400
             )
 
-        return result
+        sensitivity_fields = (
+            "floor_sensitivity",
+            "object_sensitivity",
+            "defect_sensitivity",
+        )
+        bool_fields = (
+            "enable",
+            "enable_floor_detect",
+            "enable_object_detect",
+            "enable_defect_detect",
+        )
+        coord_updates: Dict[str, Any] = {}
+        persist_updates: Dict[str, Any] = {}
+        old_enable = self.coordinator_config.enable
+
+        for field in sensitivity_fields:
+            if field not in params:
+                continue
+            value = params[field]
+            if not isinstance(value, str):
+                raise self.server.error(f"{field} must be high, medium, or low", 400)
+            try:
+                canon = _canonical_sensitivity_key(value)
+            except ValueError:
+                raise self.server.error(f"{field} must be high, medium, or low", 400)
+            setattr(self, field, canon)
+            persist_updates[field] = canon
+
+        for field in bool_fields:
+            if field not in params:
+                continue
+            value = params[field]
+            if isinstance(value, bool):
+                coord_updates[field] = value
+            elif isinstance(value, str) and value.lower() in ("true", "1", "yes", "false", "0", "no"):
+                coord_updates[field] = value.lower() in ("true", "1", "yes")
+            else:
+                raise self.server.error(f"{field} must be a boolean", 400)
+
+        if "detect_interval" in params:
+            value = params["detect_interval"]
+            if not isinstance(value, (int, float)):
+                raise self.server.error("detect_interval must be a number", 400)
+            value = float(value)
+            if value < 1.0:
+                raise self.server.error("detect_interval must be at least 1.0", 400)
+            coord_updates["detect_interval"] = value
+
+        if not persist_updates and not coord_updates:
+            raise self.server.error("No valid configuration parameters provided", 400)
+
+        if coord_updates:
+            self.coordinator_config.update(**coord_updates)
+            persist_updates["coordinator_config"] = self.coordinator_config.to_dict()
+
+        await self._persist_config(persist_updates)
+        self.server.send_event(
+            "ai_detection:config_updated",
+            self._config_notification_payload(),
+        )
+
+        if not old_enable and self.coordinator_config.enable:
+            self._maybe_start_defect_detection()
+        elif old_enable and not self.coordinator_config.enable and self._is_detecting:
+            logging.info("AI Detection: Disabled, stopping defect detection timer...")
+            self._stop_defect_timer()
+
+        return self._config_notification_payload()
 
     async def _load_config_from_database(self) -> None:
         """从数据库加载持久化的配置"""
         try:
-            # 加载检测阈值配置
-            db_obj_thresh = await self.database.get_item(
-                "ai_detection", "default_obj_thresh", None
-            )
-            if db_obj_thresh is not None:
-                self.obj_thresh = float(db_obj_thresh)
-
-            db_nms_thresh = await self.database.get_item(
-                "ai_detection", "default_nms_thresh", None
-            )
-            if db_nms_thresh is not None:
-                self.nms_thresh = float(db_nms_thresh)
-
-            db_sensitivity = await self.database.get_item(
-                "ai_detection", "default_sensitivity", None
-            )
-            if db_sensitivity is not None:
+            for field in ("floor_sensitivity", "object_sensitivity", "defect_sensitivity"):
+                value = await self.database.get_item("ai_detection", field, None)
+                if value is None:
+                    continue
                 try:
-                    self.sensitivity = _canonical_sensitivity_key(str(db_sensitivity))
+                    setattr(self, field, _canonical_sensitivity_key(str(value)))
                 except ValueError:
                     logging.warning(
-                        "AI Detection: invalid default_sensitivity in DB, ignoring: %r",
-                        db_sensitivity,
+                        "AI Detection: invalid %s in DB, ignoring: %r",
+                        field,
+                        value,
                     )
-                    self.sensitivity = None
 
             # 加载协调器配置
             db_coordinator_config = await self.database.get_item(
@@ -1245,34 +1293,11 @@ class AIDetectionClient:
             bool: 是否成功保存
         """
         try:
-            # 将配置项分别保存到数据库
             for key, value in config_updates.items():
-                if key == "default_obj_thresh":
-                    self.database.insert_item("ai_detection", "default_obj_thresh", value)
-                elif key == "default_nms_thresh":
-                    self.database.insert_item("ai_detection", "default_nms_thresh", value)
-                elif key == "default_sensitivity":
-                    if value is None:
-                        self.database.delete_item(
-                            "ai_detection", "default_sensitivity"
-                        )
-                    else:
-                        self.database.insert_item(
-                            "ai_detection", "default_sensitivity", value
-                        )
-                elif key in [
-                    "enable",
-                    "enable_foreign_detect",
-                    "enable_defect_detect",
-                    "detect_interval",
-                    "auto_pause_on_defect",
-                    "auto_pause_on_spaghetti",
-                    "auto_pause_on_zits",
-                    "auto_pause_on_stringing",
-                ]:
-                    # 协调器配置保存为一个整体
-                    coordinator_data = self.coordinator_config.to_dict()
-                    self.database.insert_item("ai_detection", "coordinator_config", coordinator_data)
+                if key in ("floor_sensitivity", "object_sensitivity", "defect_sensitivity"):
+                    self.database.insert_item("ai_detection", key, value)
+                elif key == "coordinator_config":
+                    self.database.insert_item("ai_detection", "coordinator_config", value)
 
             logging.info(f"AI Detection: Config persisted to database: {config_updates}")
             return True
@@ -1289,86 +1314,6 @@ class AIDetectionClient:
             return state in ("printing", "paused")
         except Exception:
             return False
-
-    def _update_coordinator_config(self, **kwargs) -> Dict[str, Any]:
-        """更新协调器配置
-
-        Args:
-            **kwargs: 要更新的配置项
-
-        Returns:
-            Dict[str, Any]: 更新后的完整配置
-
-        Raises:
-            ValueError: 配置值无效时抛出
-        """
-        # 记录 enable 的旧值
-        old_enable = self.coordinator_config.enable
-
-        # 更新配置
-        updates = {}
-        for key in [
-            "enable",
-            "enable_foreign_detect",
-            "enable_defect_detect",
-            "detect_interval",
-            "auto_pause_on_defect",
-            "auto_pause_on_spaghetti",
-            "auto_pause_on_zits",
-            "auto_pause_on_stringing",
-        ]:
-            if key in kwargs:
-                value = kwargs[key]
-                # 类型验证
-                if key == "detect_interval":
-                    if not isinstance(value, (int, float)):
-                        raise ValueError(f"{key} must be a number")
-                    value = float(value)
-                    if value < 1.0:
-                        raise ValueError(f"{key} must be at least 1.0")
-                elif isinstance(value, bool):
-                    pass
-                elif isinstance(value, str):
-                    if value.lower() in ("true", "1", "yes"):
-                        value = True
-                    elif value.lower() in ("false", "0", "no"):
-                        value = False
-                    else:
-                        raise ValueError(f"{key} must be a boolean")
-                else:
-                    raise ValueError(f"{key} must be a boolean")
-
-                updates[key] = value
-
-        if not updates:
-            raise ValueError("No valid configuration parameters provided")
-
-        # 应用更新
-        self.coordinator_config.update(**updates)
-
-        logging.info(
-            f"AI Detection: Coordinator config updated: {updates}"
-        )
-
-        # 持久化配置到文件
-        self.eventloop.create_task(self._persist_config(updates))
-
-        # 发送配置更新通知（包含所有配置）
-        self.server.send_event(
-            "ai_detection:config_updated",
-            self._config_notification_payload(),
-        )
-
-        # 如果 enable 从 false 变为 true，检查是否需要启动定时检测
-        if not old_enable and self.coordinator_config.enable:
-            self._maybe_start_defect_detection()
-        # 如果 enable 从 true 变为 false，停止定时检测
-        elif old_enable and not self.coordinator_config.enable:
-            if self._is_detecting:
-                logging.info("AI Detection: Disabled, stopping defect detection timer...")
-                self._stop_defect_timer()
-
-        return self.coordinator_config.to_dict()
 
     def _maybe_start_defect_detection(self) -> None:
         """如果条件满足，启动定时缺陷检测"""
@@ -1461,8 +1406,7 @@ class AIDetectionClient:
 
         logging.debug("AI Detection: Performing defect detection...")
         result = await self.detect_defect(
-            scenario=DetectionScenario.PRINTING_DEFECT_PERIODIC,
-            send_notification=False  # 先不发送通知，根据warning决定
+            scenario=DetectionScenario.PRINTING_DEFECT_PERIODIC
         )
 
         # 只在warning时发送通知
@@ -1486,34 +1430,7 @@ class AIDetectionClient:
                 message=message
             )
 
-            # 判断是否需要自动暂停
-            if self._should_auto_pause(result):
-                await self._pause_print(result)
-
-    def _should_auto_pause(self, result: DefectDetectionResult) -> bool:
-        """判断是否需要自动暂停
-
-        Args:
-            result: DefectDetectionResult
-
-        Returns:
-            bool: 是否需要自动暂停
-        """
-        if not self.coordinator_config.auto_pause_on_defect:
-            return False
-
-        for cls in result.classes:
-            if cls == 0 and self.coordinator_config.auto_pause_on_spaghetti:
-                # 意面效应
-                return True
-            elif cls == 1 and self.coordinator_config.auto_pause_on_zits:
-                # 疙瘩
-                return True
-            elif cls == 2 and self.coordinator_config.auto_pause_on_stringing:
-                # 拉丝
-                return True
-
-        return False
+            await self._pause_print()
 
     def _can_auto_pause_print(self) -> bool:
         """仅在实际打印中允许 AI 发起自动暂停。"""
@@ -1527,12 +1444,8 @@ class AIDetectionClient:
             return False
         return job_event in (JobEvent.STARTED, JobEvent.RESUMED)
 
-    async def _pause_print(self, result: DefectDetectionResult) -> None:
-        """暂停打印
-
-        Args:
-            result: DefectDetectionResult
-        """
+    async def _pause_print(self) -> None:
+        """暂停打印。"""
         if not self._can_auto_pause_print():
             logging.info(
                 "AI Detection: Ignoring auto-pause request because printer is not actively printing"
