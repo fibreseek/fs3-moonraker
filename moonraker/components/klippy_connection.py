@@ -114,6 +114,10 @@ class KlippyConnection:
         self.recover_attempts = 0
         self._last_recover_time: Optional[float] = None
         self._auto_recover_task: Optional[asyncio.Task] = None
+        # Suppress duplicate "!!" gcode errors forwarded to clients/console
+        self.gcode_error_dedup_interval = config.getfloat(
+            'gcode_error_dedup_interval', 5.0)
+        self._recent_gcode_errors: Dict[str, float] = {}
 
     @property
     def klippy_apis(self) -> KlippyAPI:
@@ -684,7 +688,30 @@ class KlippyConnection:
         except Exception:
             logging.exception(f"Error running remote method: {method_name}")
 
+    def _should_suppress_gcode_error(self, response: str) -> bool:
+        if self.gcode_error_dedup_interval <= 0:
+            return False
+        clean = response.strip()
+        if not clean.startswith("!!"):
+            return False
+        now = time.time()
+        cutoff = now - self.gcode_error_dedup_interval
+        self._recent_gcode_errors = {
+            key: ts for key, ts in self._recent_gcode_errors.items()
+            if ts >= cutoff
+        }
+        if clean in self._recent_gcode_errors:
+            return True
+        self._recent_gcode_errors[clean] = now
+        return False
+
     def _process_gcode_response(self, response: str) -> None:
+        if self._should_suppress_gcode_error(response):
+            logging.debug(
+                "Suppressed duplicate gcode error within %.1fs: %s",
+                self.gcode_error_dedup_interval, response.strip()
+            )
+            return
         self.server.send_event("server:gcode_response", response)
 
     def _process_status_update(
