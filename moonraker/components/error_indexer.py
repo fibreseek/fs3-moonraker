@@ -36,6 +36,9 @@ class ErrorIndexer:
         self.ai_error_db: Dict[str, Dict[str, Any]] = {}
         # common 专有名词翻译表
         self.common_terms: Dict[str, Dict[str, Dict[str, str]]] = {}
+        # 相同错误码+消息在时间窗口内只通知一次，0 表示禁用去重
+        self.dedup_interval = config.getfloat("dedup_interval", 5.0)
+        self._recent_errors: Dict[str, float] = {}
         # 加载错误数据库
         self._load_error_db()
         self._load_ai_error_db()
@@ -591,6 +594,20 @@ class ErrorIndexer:
                 error_db=self.ai_error_db,
             )
 
+    def _is_duplicate_error(self, error_msg: str) -> bool:
+        """Return True if the same error message was notified within dedup_interval."""
+        if self.dedup_interval <= 0:
+            return False
+        now = time.time()
+        cutoff = now - self.dedup_interval
+        self._recent_errors = {
+            key: ts for key, ts in self._recent_errors.items() if ts >= cutoff
+        }
+        if error_msg in self._recent_errors:
+            return True
+        self._recent_errors[error_msg] = now
+        return False
+
     def _process_error(
         self,
         error_msg: str,
@@ -608,6 +625,12 @@ class ErrorIndexer:
                 code, placeholder_values = match_result
         if not code:
             code = "UNKNOWN"
+        if self._is_duplicate_error(error_msg):
+            logging.debug(
+                "Error Indexer: Suppressed duplicate error within %.1fs: %s",
+                self.dedup_interval, error_msg
+            )
+            return
         if placeholder_values is None:
             placeholder_values = ()
         resolved_placeholder_values = self._resolve_placeholder_values(
