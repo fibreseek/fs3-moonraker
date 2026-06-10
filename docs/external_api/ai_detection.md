@@ -352,6 +352,8 @@ AI 是否参与打印前预检，当前推荐由 AI 配置控制，而不是依�
 - `skip_foreign_detect=true` 时，跳过 AI 预检
 - 跳过范围包括底板检测和异物检测
 - 耗材等其他预检仍继续执行
+- 发起打印时，Moonraker 会把持久化的 `server.ai_detection.config.enable`
+  同步为 `!skip_foreign_detect`，以保持打印前 AI 总开关与兼容参数一致
 
 如果需要跳过整个预检查流程，应继续使用：
 
