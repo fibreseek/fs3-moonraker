@@ -208,9 +208,9 @@ class DetectionParams:
 
 # 上位机三档灵敏度：对应下发给 AI 服务的 obj_thresh（置信度门槛）
 SENSITIVITY_OBJ_THRESH: Dict[str, float] = {
-    "high": 0.5,
-    "medium": 0.65,
-    "low": 0.8,
+    "high": 0.35,
+    "medium": 0.55,
+    "low": 0.7,
 }
 
 _SENSITIVITY_LABEL_TO_KEY: Dict[str, str] = {
