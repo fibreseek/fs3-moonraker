@@ -606,6 +606,30 @@ class AIDetectionClient:
         """检查 AI 检测总开关是否启用（不考虑连接状态）"""
         return self.coordinator_config.enable
 
+    async def set_enabled(self, enable: bool) -> Dict[str, Any]:
+        """更新 AI 总开关并持久化到数据库。"""
+        old_enable = self.coordinator_config.enable
+        if old_enable == enable:
+            return self._config_notification_payload()
+
+        self.coordinator_config.enable = enable
+        await self._persist_config({
+            "coordinator_config": self.coordinator_config.to_dict()
+        })
+
+        self.server.send_event(
+            "ai_detection:config_updated",
+            self._config_notification_payload(),
+        )
+
+        if not old_enable and self.coordinator_config.enable:
+            self._maybe_start_defect_detection()
+        elif old_enable and not self.coordinator_config.enable and self._is_detecting:
+            logging.info("AI Detection: Disabled, stopping defect detection timer...")
+            self._stop_defect_timer()
+
+        return self._config_notification_payload()
+
     def is_floor_detect_enabled(self) -> bool:
         """检查是否启用底板检测"""
         return (

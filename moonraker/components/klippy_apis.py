@@ -279,6 +279,27 @@ class KlippyAPI(APITransport):
             except Exception as e:
                 logging.warning(f"Failed to execute command '{cmd}': {e}")
 
+        # 按兼容参数同步持久化的 AI 总开关：skip_foreign_detect=true 时关闭，
+        # false 时重新开启，保持上位机与 Moonraker 的打印前状态一致。
+        try:
+            ai_detection = self.server.lookup_component("ai_detection")
+            target_enable = not skip_foreign_detect
+            if ai_detection.is_enabled() != target_enable:
+                logging.info(
+                    "AI Detection: syncing persistent enable to %s due to "
+                    "skip_foreign_detect=%s",
+                    target_enable,
+                    skip_foreign_detect,
+                )
+                await ai_detection.set_enabled(target_enable)
+        except Exception as e:
+            logging.warning(
+                "AI Detection: failed to sync persistent enable from "
+                "skip_foreign_detect=%s: %s",
+                skip_foreign_detect,
+                e,
+            )
+
         # 打印前预检查（AI / 传感器等）
         if not skip_precheck:
             await self._run_precheck(
