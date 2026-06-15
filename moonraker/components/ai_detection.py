@@ -221,6 +221,17 @@ _SENSITIVITY_LABEL_TO_KEY: Dict[str, str] = {
 _OBJECT_CLASS_IDS = ("0", "1", "2")
 _DEFECT_CLASS_IDS = ("0", "1", "2")
 
+# 检测投票：最多 N 次；累计或连续达到阈值即报错，并支持提前结束
+DETECT_VOTE_ATTEMPTS = 5
+DETECT_VOTE_ERROR_THRESHOLD = 3
+
+
+@dataclass
+class _VoteRoundResult:
+    should_fail: bool
+    trigger_count: int
+    attempts_used: int
+
 
 def _canonical_sensitivity_key(value: str) -> str:
     """将 API 档位标签规范为 high|medium|low（英文，大小写不敏感）。非法则抛 ValueError。"""
@@ -954,6 +965,88 @@ class AIDetectionClient:
             self._stats["last_error"] = str(e)
             raise
 
+    async def _run_vote_detection_round(
+        self,
+        label: str,
+        detect_once: Callable[[], Coroutine[Any, Any, bool]],
+        *,
+        count_exceptions_as_trigger: bool = True,
+    ) -> _VoteRoundResult:
+        """多轮检测投票：连续达到阈值或累计无法再达标时提前结束。"""
+        trigger_count = 0
+        consecutive_triggers = 0
+
+        for attempt in range(1, DETECT_VOTE_ATTEMPTS + 1):
+            triggered = False
+            try:
+                triggered = await detect_once()
+            except Exception as e:
+                if count_exceptions_as_trigger:
+                    triggered = True
+                logging.warning(
+                    "AI Detection: %s attempt %d/%d failed: %s",
+                    label,
+                    attempt,
+                    DETECT_VOTE_ATTEMPTS,
+                    e,
+                )
+
+            if triggered:
+                trigger_count += 1
+                consecutive_triggers += 1
+                status = "triggered"
+            else:
+                consecutive_triggers = 0
+                status = "ok"
+
+            logging.info(
+                "AI Detection: %s attempt %d/%d: %s",
+                label,
+                attempt,
+                DETECT_VOTE_ATTEMPTS,
+                status,
+            )
+
+            if consecutive_triggers >= DETECT_VOTE_ERROR_THRESHOLD:
+                logging.warning(
+                    "AI Detection: %s stopped early after %d consecutive "
+                    "triggers (%d/%d attempts used)",
+                    label,
+                    consecutive_triggers,
+                    trigger_count,
+                    attempt,
+                )
+                return _VoteRoundResult(True, trigger_count, attempt)
+
+            remaining = DETECT_VOTE_ATTEMPTS - attempt
+            if trigger_count + remaining < DETECT_VOTE_ERROR_THRESHOLD:
+                logging.info(
+                    "AI Detection: %s passed early after %d attempts "
+                    "(%d triggers, cannot reach threshold)",
+                    label,
+                    attempt,
+                    trigger_count,
+                )
+                return _VoteRoundResult(False, trigger_count, attempt)
+
+        should_fail = trigger_count >= DETECT_VOTE_ERROR_THRESHOLD
+        return _VoteRoundResult(should_fail, trigger_count, DETECT_VOTE_ATTEMPTS)
+
+    async def _detect_defect_once(
+        self,
+        obj_thresh: Optional[float] = None,
+        nms_thresh: Optional[float] = None,
+        is_lite: bool = False,
+    ) -> DefectDetectionResult:
+        """执行单次缺陷检测，不发送通知。"""
+        params = DetectionParams(
+            obj_thresh=self._effective_defect_obj_thresh(obj_thresh),
+            nms_thresh=nms_thresh if nms_thresh is not None else self.nms_thresh,
+            is_lite=is_lite
+        )
+        result_data = await self._send_request(DetectionType.DEFECT_DETECT, params)
+        return DefectDetectionResult.from_dict(result_data)
+
     async def detect_defect(
         self,
         obj_thresh: Optional[float] = None,
@@ -975,14 +1068,11 @@ class AIDetectionClient:
         if not self.is_connected:
             return DefectDetectionResult(is_valid=False, warning=False)
 
-        params = DetectionParams(
-            obj_thresh=self._effective_defect_obj_thresh(obj_thresh),
-            nms_thresh=nms_thresh if nms_thresh is not None else self.nms_thresh,
-            is_lite=is_lite
+        result = await self._detect_defect_once(
+            obj_thresh=obj_thresh,
+            nms_thresh=nms_thresh,
+            is_lite=is_lite,
         )
-
-        result_data = await self._send_request(DetectionType.DEFECT_DETECT, params)
-        result = DefectDetectionResult.from_dict(result_data)
 
         if result.warning:
             logging.warning(
@@ -993,13 +1083,30 @@ class AIDetectionClient:
 
         return result
 
+    async def _detect_floor_once(
+        self,
+        obj_thresh: Optional[float] = None,
+        nms_thresh: Optional[float] = None,
+    ) -> tuple[str, Optional[str]]:
+        """执行单次底板检测，不发送通知。返回 (status, error_message)。"""
+        params = DetectionParams(
+            obj_thresh=self._effective_floor_obj_thresh(obj_thresh),
+            nms_thresh=nms_thresh if nms_thresh is not None else self.nms_thresh
+        )
+        result_data = await self._send_request(DetectionType.FLOOR_DETECT, params)
+        result = FloorDetectionResult.from_dict(result_data)
+        if result.has_build_plate:
+            return "ok", None
+
+        return "error", "AI Detection: Build plate not detected"
+
     async def detect_floor(
         self,
         obj_thresh: Optional[float] = None,
         nms_thresh: Optional[float] = None,
         scenario: DetectionScenario = DetectionScenario.PREPRINT_FLOOR
     ) -> str:
-        """执行打印前底板检测"""
+        """执行打印前底板检测（连续多次，多数失败才报错）"""
         if not self.is_connected:
             msg = "AI Detection service is not connected"
             self._send_detection_notification(
@@ -1012,44 +1119,56 @@ class AIDetectionClient:
             logging.info("AI Detection is disabled, skipping floor detection")
             return "ok"
 
-        params = DetectionParams(
-            obj_thresh=self._effective_floor_obj_thresh(obj_thresh),
-            nms_thresh=nms_thresh if nms_thresh is not None else self.nms_thresh
-        )
-        result_data = await self._send_request(DetectionType.FLOOR_DETECT, params)
-        result = FloorDetectionResult.from_dict(result_data)
-        if result.has_build_plate:
-            logging.info("AI Detection: Build plate detected")
-            return "ok"
+        last_error_msg = "AI Detection: Build plate not detected"
 
-        msg = "AI Detection: Build plate not detected"
-        logging.warning(msg)
-        self._send_detection_notification(
-            scenario=scenario,
-            detection_type="floor",
-            message=msg
-        )
-        return "error"
+        async def _once() -> bool:
+            nonlocal last_error_msg
+            try:
+                status, error_msg = await self._detect_floor_once(
+                    obj_thresh=obj_thresh,
+                    nms_thresh=nms_thresh,
+                )
+            except Exception as e:
+                last_error_msg = str(e)
+                raise
+            if status == "error":
+                if error_msg:
+                    last_error_msg = error_msg
+                return True
+            return False
 
-    async def detect_object(
+        vote = await self._run_vote_detection_round(
+            "Floor detection", _once
+        )
+
+        if vote.should_fail:
+            logging.warning(
+                "AI Detection: Build plate check failed "
+                "(%d/%d attempts triggered)",
+                vote.trigger_count,
+                vote.attempts_used,
+            )
+            self._send_detection_notification(
+                scenario=scenario,
+                detection_type="floor",
+                message=last_error_msg,
+            )
+            return "error"
+
+        logging.info(
+            "AI Detection: Build plate detected "
+            "(%d/%d attempts triggered, below threshold)",
+            vote.trigger_count,
+            vote.attempts_used,
+        )
+        return "ok"
+
+    async def _detect_object_once(
         self,
         obj_thresh: Optional[float] = None,
         nms_thresh: Optional[float] = None,
-        scenario: DetectionScenario = DetectionScenario.PREPRINT_OBJECT
-    ) -> str:
-        """执行打印前异物/手部/底板异常检测"""
-        if not self.is_connected:
-            msg = "AI Detection service is not connected"
-            self._send_detection_notification(
-                scenario=scenario,
-                detection_type="object",
-                message=msg
-            )
-            return "error"
-        if not self.coordinator_config.enable or not self.coordinator_config.enable_object_detect:
-            logging.info("AI Detection is disabled, skipping object detection")
-            return "ok"
-
+    ) -> tuple[str, Optional[str]]:
+        """执行单次异物检测，不发送通知。返回 (status, error_message)。"""
         params = DetectionParams(
             obj_thresh=self._effective_object_obj_thresh(obj_thresh),
             nms_thresh=nms_thresh if nms_thresh is not None else self.nms_thresh
@@ -1065,30 +1184,76 @@ class AIDetectionClient:
         )
 
         if result.build_plate_issue:
-            msg = "AI Detection: Build plate not detected"
-            logging.warning(msg)
-            self._send_detection_notification(
-                scenario=scenario,
-                detection_type="object",
-                message=msg
-            )
-            return "error"
+            return "error", "AI Detection: Build plate not detected"
 
         if result.is_valid and result.has_object:
             if 1 in result.classes:
-                msg = "AI Detection: Hand detected"
-            else:
-                msg = "AI Detection: Foreign object detected"
-            logging.warning(msg)
+                return "error", "AI Detection: Hand detected"
+            return "error", "AI Detection: Foreign object detected"
+
+        return "ok", None
+
+    async def detect_object(
+        self,
+        obj_thresh: Optional[float] = None,
+        nms_thresh: Optional[float] = None,
+        scenario: DetectionScenario = DetectionScenario.PREPRINT_OBJECT
+    ) -> str:
+        """执行打印前异物/手部/底板异常检测（连续多次，多数失败才报错）"""
+        if not self.is_connected:
+            msg = "AI Detection service is not connected"
             self._send_detection_notification(
                 scenario=scenario,
                 detection_type="object",
                 message=msg
             )
             return "error"
+        if not self.coordinator_config.enable or not self.coordinator_config.enable_object_detect:
+            logging.info("AI Detection is disabled, skipping object detection")
+            return "ok"
 
-        logging.info("AI Detection: No objects detected")
+        last_error_msg = "AI Detection: Object detection failed"
 
+        async def _once() -> bool:
+            nonlocal last_error_msg
+            try:
+                status, error_msg = await self._detect_object_once(
+                    obj_thresh=obj_thresh,
+                    nms_thresh=nms_thresh,
+                )
+            except Exception as e:
+                last_error_msg = str(e)
+                raise
+            if status == "error":
+                if error_msg:
+                    last_error_msg = error_msg
+                return True
+            return False
+
+        vote = await self._run_vote_detection_round(
+            "Object detection", _once
+        )
+
+        if vote.should_fail:
+            logging.warning(
+                "AI Detection: Object check failed "
+                "(%d/%d attempts triggered)",
+                vote.trigger_count,
+                vote.attempts_used,
+            )
+            self._send_detection_notification(
+                scenario=scenario,
+                detection_type="object",
+                message=last_error_msg,
+            )
+            return "error"
+
+        logging.info(
+            "AI Detection: No objects detected "
+            "(%d/%d attempts triggered, below threshold)",
+            vote.trigger_count,
+            vote.attempts_used,
+        )
         return "ok"
 
     async def connect(self) -> bool:
@@ -1421,7 +1586,7 @@ class AIDetectionClient:
             self._is_detecting = False
 
     async def _perform_defect_detection(self) -> None:
-        """执行一次缺陷检测（打印中定时检测）"""
+        """执行一轮缺陷检测（连续多次，多数 warning 才报警并暂停）"""
         if not self.is_connected:
             logging.warning(
                 "AI Detection: Not connected for defect detection, skipping..."
@@ -1429,32 +1594,57 @@ class AIDetectionClient:
             return
 
         logging.debug("AI Detection: Performing defect detection...")
-        result = await self.detect_defect(
-            scenario=DetectionScenario.PRINTING_DEFECT_PERIODIC
+        last_warning_result: Optional[DefectDetectionResult] = None
+
+        async def _once() -> bool:
+            nonlocal last_warning_result
+            result = await self._detect_defect_once()
+            if result.warning:
+                last_warning_result = result
+                return True
+            return False
+
+        vote = await self._run_vote_detection_round(
+            "Defect detection",
+            _once,
+            count_exceptions_as_trigger=False,
         )
 
-        # 只在warning时发送通知
-        if result.warning:
-            logging.warning(
-                f"AI Detection: Defect detected! "
-                f"Classes: {result.classes}, Boxes: {result.boxes}"
+        if not vote.should_fail:
+            logging.debug(
+                "AI Detection: Defect check passed "
+                "(%d/%d attempts warned, below threshold)",
+                vote.trigger_count,
+                vote.attempts_used,
             )
+            return
 
-            # 根据result解析
-            class_registry = get_class_registry()
-            class_names = [class_registry.get_defect_name(cls) for cls in result.classes]
-            defect_types = ", ".join(class_names)
-            message = f"Defect detected: {defect_types}"
-            logging.info(f"AI Detection: Defect message: {message}")
+        result = last_warning_result or DefectDetectionResult(
+            is_valid=False, warning=True
+        )
+        logging.warning(
+            "AI Detection: Defect check failed "
+            "(%d/%d attempts warned) - "
+            "Classes: %s, Boxes: %s",
+            vote.trigger_count,
+            vote.attempts_used,
+            result.classes,
+            result.boxes,
+        )
 
-            # 发送通知
-            self._send_detection_notification(
-                scenario=DetectionScenario.PRINTING_DEFECT_PERIODIC,
-                detection_type="defect",
-                message=message
-            )
+        class_registry = get_class_registry()
+        class_names = [class_registry.get_defect_name(cls) for cls in result.classes]
+        defect_types = ", ".join(class_names) if class_names else "unknown"
+        message = f"Defect detected: {defect_types}"
+        logging.info(f"AI Detection: Defect message: {message}")
 
-            await self._pause_print()
+        self._send_detection_notification(
+            scenario=DetectionScenario.PRINTING_DEFECT_PERIODIC,
+            detection_type="defect",
+            message=message
+        )
+
+        await self._pause_print()
 
     def _can_auto_pause_print(self) -> bool:
         """仅在实际打印中允许 AI 发起自动暂停。"""

@@ -219,11 +219,8 @@ class SSDPServer(asyncio.protocols.DatagramProtocol):
         )
 
         self.machine = self.server.lookup_component("machine")
-        logging.info(f"machine: {self.machine}")
         self.machine_name = self.machine.get_machine_name()
-        logging.info(f"machine_name: {self.machine_name}")
         self.machine_id: str = self.machine.get_machine_id()
-        logging.info(f"machine_id: {self.machine_id}")
 
         # Register event handler for machine name changed
         self.server.register_event_handler(
@@ -235,7 +232,7 @@ class SSDPServer(asyncio.protocols.DatagramProtocol):
 
     def _on_machine_name_changed(self, machine_name: str) -> None:
         """Called when machine name is changed, updates response headers"""
-        logging.info(f"Machine name changed: {machine_name}")
+        logging.debug(f"Machine name changed: {machine_name}")
         self.machine_name = machine_name
         # Update response headers
         for header in self.response_headers:
@@ -252,7 +249,7 @@ class SSDPServer(asyncio.protocols.DatagramProtocol):
 
     def _on_machine_id_changed(self, machine_id: str) -> None:
         """Called when machine ID is changed, updates response headers"""
-        logging.info(f"Machine ID changed: {machine_id}")
+        logging.debug(f"Machine ID changed: {machine_id}")
         self.machine_id = machine_id
         # Update response headers
         for header in self.response_headers:
@@ -386,7 +383,6 @@ class SSDPServer(asyncio.protocols.DatagramProtocol):
         logging.debug("SSDP Resume Writing Requested")
 
     def datagram_received(self, data: bytes, addr: tuple[str | Any, int]) -> None:
-        # logging.info(f"SSDP Datagram Received: {data} from {addr}")
         if not self.registered:
             return
         try:
@@ -405,27 +401,26 @@ class SSDPServer(asyncio.protocols.DatagramProtocol):
             headers[parts[0].upper()] = parts[1].strip()
         special_marker = headers.get("X-SPECIAL-MARKER")
         if special_marker != "FIBRESEEK3D":
-            # logging.info("SSDP Special Marker not found or doesn't match")
             return
-        logging.info(f"SSDP Datagram Received: {data} from {addr}")
+        logging.debug(f"SSDP Datagram Received: {data} from {addr}")
         if (
             ssdp_command != "M-SEARCH * HTTP/1.1" or
             headers.get("MAN") != '"ssdp:discover"'
         ):
             # Not a discovery request
-            logging.info(f"SSDP Command {ssdp_command} doesn't apply")
+            logging.debug(f"SSDP Command {ssdp_command} doesn't apply")
             return
         if headers.get("ST") not in ["upnp:rootdevice", "ssdp:all"]:
             # Service Type doesn't apply
-            logging.info(f"SSDP Service Type {headers.get('ST')} doesn't apply")
+            logging.debug(f"SSDP Service Type {headers.get('ST')} doesn't apply")
             return
         if self.response_handle is not None:
             # response in progress
-            logging.info("SSDP Response already in progress, ignoring request")
+            logging.debug("SSDP Response already in progress, ignoring request")
             return
         if "MX" in headers:
             delay_time = random.uniform(0, float(headers["MX"]))
-            logging.info(f"Delaying response by {delay_time:.2f} seconds")
+            logging.debug(f"Delaying response by {delay_time:.2f} seconds")
             eventloop = self.server.get_event_loop()
             self.response_handle = eventloop.delay_callback(
                 delay_time, self._respond_to_discovery, addr
@@ -474,7 +469,7 @@ class SSDPServer(asyncio.protocols.DatagramProtocol):
         return notifications
 
     def error_received(self, exc: Exception) -> None:
-        logging.info(f"SSDP Server Error: {exc}")
+        logging.debug(f"SSDP Server Error: {exc}")
 
 
 def load_component(config: ConfigHelper) -> ZeroconfRegistrar:
