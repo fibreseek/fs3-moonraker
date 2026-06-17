@@ -218,6 +218,7 @@ class KlippyAPI(APITransport):
             filename = filename[1:]
 
         await self._validate_print_start_state()
+        self.klippy.reset_auto_recovery("print start")
 
         # 保存带子文件夹路径的文件名，用于 SAVE_VARIABLE
         filename_with_path = filename
@@ -384,31 +385,31 @@ class KlippyAPI(APITransport):
             logging.warning(f"Precheck: failed to set print state to precheck: {e}")
 
         try:
-            # 0. 打印前准备：归位、移动到清洁位置等，供后续 AI 检测使用
-            try:
-                logging.info("Precheck: running PREPARE_PRINTING...")
-                await self.run_gcode("PREPARE_PRINTING")
-                logging.info("Precheck: PREPARE_PRINTING completed")
-            except self.server.error as e:
-                msg = f"Precheck: PREPARE_PRINTING failed: {e}"
-                logging.warning(msg)
-                self.server.send_event(
-                    "precheck:failed",
-                    {
-                        "message": msg,
-                        "step": "prepare_printing",
-                        "http_code": getattr(e, "status_code", 500),
-                    },
-                )
-                raise
-            except Exception as e:
-                msg = f"Precheck: PREPARE_PRINTING failed: {e}"
-                logging.warning(msg)
-                self.server.send_event(
-                    "precheck:failed",
-                    {"message": msg, "step": "prepare_printing", "http_code": 503},
-                )
-                raise self.server.error(msg, 503)
+            # # 0. 打印前准备：归位、移动到清洁位置等，供后续 AI 检测使用
+            # try:
+            #     logging.info("Precheck: running PREPARE_PRINTING...")
+            #     await self.run_gcode("PREPARE_PRINTING")
+            #     logging.info("Precheck: PREPARE_PRINTING completed")
+            # except self.server.error as e:
+            #     msg = f"Precheck: PREPARE_PRINTING failed: {e}"
+            #     logging.warning(msg)
+            #     self.server.send_event(
+            #         "precheck:failed",
+            #         {
+            #             "message": msg,
+            #             "step": "prepare_printing",
+            #             "http_code": getattr(e, "status_code", 500),
+            #         },
+            #     )
+            #     raise
+            # except Exception as e:
+            #     msg = f"Precheck: PREPARE_PRINTING failed: {e}"
+            #     logging.warning(msg)
+            #     self.server.send_event(
+            #         "precheck:failed",
+            #         {"message": msg, "step": "prepare_printing", "http_code": 503},
+            #     )
+            #     raise self.server.error(msg, 503)
 
             # 1. 打印前 AI 检测：先底板，再异物检测
             try:

@@ -543,6 +543,17 @@ class KlippyConnection:
                     )
             self._klippy_initializing = False
 
+    def reset_auto_recovery(self, reason: str = "") -> None:
+        """Reset auto-recovery attempt counter, restoring full retry budget."""
+        if self.recover_attempts > 0 or self._last_recover_time is not None:
+            suffix = f" ({reason})" if reason else ""
+            logging.info(
+                f"Auto-recovery counter reset{suffix} (was "
+                f"{self.recover_attempts}/{self.max_recover_attempts})"
+            )
+        self.recover_attempts = 0
+        self._last_recover_time = None
+
     async def _attempt_auto_recovery(self) -> None:
         """Attempt to automatically recover Klippy when it's in SHUTDOWN state."""
         logging.info("Klippy has entered SHUTDOWN state")
@@ -559,11 +570,9 @@ class KlippyConnection:
         if self._last_recover_time is not None:
             time_since_last = current_time - self._last_recover_time
             if time_since_last >= self.recover_reset_timeout:
-                logging.info(
-                    f"Auto-recovery timeout ({self.recover_reset_timeout:.0f}s) exceeded, "
-                    f"resetting recover_attempts from {self.recover_attempts} to 0"
+                self.reset_auto_recovery(
+                    f"timeout {self.recover_reset_timeout:.0f}s exceeded"
                 )
-                self.recover_attempts = 0
         
         # Check if we've exceeded maximum recovery attempts
         if self.recover_attempts >= self.max_recover_attempts:

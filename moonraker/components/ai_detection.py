@@ -286,12 +286,12 @@ class DefectDetectionResult:
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "DefectDetectionResult":
-        # 解析 warning 字段（处理字符串形式的布尔值）
+        is_valid_bool = cls._parse_bool(data.get("is_valid", False), False)
         warning_value = data.get("WARNING", data.get("warning", False))
         warning_bool = cls._parse_bool(warning_value, False)
 
         return cls(
-            is_valid=data.get("is_valid", False),
+            is_valid=is_valid_bool,
             boxes=data.get("boxes", []),
             classes=data.get("classes", []),
             scores=data.get("scores", []),
@@ -410,7 +410,9 @@ class CoordinatorConfig:
     enable_defect_detect: bool = True
 
     # 检测间隔（秒）
-    detect_interval: float = 10.0
+    detect_interval: float = 30.0
+    # 同一轮投票检测中，各次请求之间的间隔（秒）
+    detect_vote_interval: float = 0.5
 
     @classmethod
     def from_config(cls, config: "ConfigHelper") -> "CoordinatorConfig":
@@ -427,7 +429,10 @@ class CoordinatorConfig:
                 "enable_defect_detect", True
             ),
             detect_interval=config.getfloat(
-                "detect_interval", 10.0, minval=1.0
+                "detect_interval", 30.0, minval=1.0
+            ),
+            detect_vote_interval=config.getfloat(
+                "detect_vote_interval", 0.5, minval=0.0
             ),
         )
 
@@ -439,6 +444,7 @@ class CoordinatorConfig:
             "enable_object_detect": self.enable_object_detect,
             "enable_defect_detect": self.enable_defect_detect,
             "detect_interval": self.detect_interval,
+            "detect_vote_interval": self.detect_vote_interval,
         }
 
     def update(self, **kwargs) -> None:
@@ -971,6 +977,7 @@ class AIDetectionClient:
         detect_once: Callable[[], Coroutine[Any, Any, bool]],
         *,
         count_exceptions_as_trigger: bool = True,
+        attempt_interval: float = 0.0,
     ) -> _VoteRoundResult:
         """多轮检测投票：连续达到阈值或累计无法再达标时提前结束。"""
         trigger_count = 0
@@ -994,18 +1001,14 @@ class AIDetectionClient:
             if triggered:
                 trigger_count += 1
                 consecutive_triggers += 1
-                status = "triggered"
+                logging.info(
+                    "AI Detection: %s attempt %d/%d: triggered",
+                    label,
+                    attempt,
+                    DETECT_VOTE_ATTEMPTS,
+                )
             else:
                 consecutive_triggers = 0
-                status = "ok"
-
-            logging.info(
-                "AI Detection: %s attempt %d/%d: %s",
-                label,
-                attempt,
-                DETECT_VOTE_ATTEMPTS,
-                status,
-            )
 
             if consecutive_triggers >= DETECT_VOTE_ERROR_THRESHOLD:
                 logging.warning(
@@ -1020,14 +1023,26 @@ class AIDetectionClient:
 
             remaining = DETECT_VOTE_ATTEMPTS - attempt
             if trigger_count + remaining < DETECT_VOTE_ERROR_THRESHOLD:
-                logging.info(
-                    "AI Detection: %s passed early after %d attempts "
-                    "(%d triggers, cannot reach threshold)",
-                    label,
-                    attempt,
-                    trigger_count,
-                )
+                if trigger_count > 0:
+                    logging.info(
+                        "AI Detection: %s passed early after %d attempts "
+                        "(%d triggers, cannot reach threshold)",
+                        label,
+                        attempt,
+                        trigger_count,
+                    )
+                else:
+                    logging.debug(
+                        "AI Detection: %s passed early after %d attempts "
+                        "(%d triggers, cannot reach threshold)",
+                        label,
+                        attempt,
+                        trigger_count,
+                    )
                 return _VoteRoundResult(False, trigger_count, attempt)
+
+            if attempt_interval > 0 and attempt < DETECT_VOTE_ATTEMPTS:
+                await asyncio.sleep(attempt_interval)
 
         should_fail = trigger_count >= DETECT_VOTE_ERROR_THRESHOLD
         return _VoteRoundResult(should_fail, trigger_count, DETECT_VOTE_ATTEMPTS)
@@ -1074,7 +1089,7 @@ class AIDetectionClient:
             is_lite=is_lite,
         )
 
-        if result.warning:
+        if result.is_valid:
             logging.warning(
                 f"AI 检测: 检测到缺陷 - "
                 f"类别: {result.classes}, 位置: {result.boxes}, "
@@ -1336,6 +1351,7 @@ class AIDetectionClient:
                 "enable_object_detect": self.coordinator_config.enable_object_detect,
                 "enable_defect_detect": self.coordinator_config.enable_defect_detect,
                 "detect_interval": self.coordinator_config.detect_interval,
+                "detect_vote_interval": self.coordinator_config.detect_vote_interval,
             },
             "class_mappings": self.class_registry.get_all_mappings(),
             # 协调器状态
@@ -1369,6 +1385,7 @@ class AIDetectionClient:
             "object_sensitivity",
             "defect_sensitivity",
             "detect_interval",
+            "detect_vote_interval",
         }
         invalid_keys = sorted(set(params.keys()) - allowed_keys)
         if invalid_keys:
@@ -1423,6 +1440,17 @@ class AIDetectionClient:
             if value < 1.0:
                 raise self.server.error("detect_interval must be at least 1.0", 400)
             coord_updates["detect_interval"] = value
+
+        if "detect_vote_interval" in params:
+            value = params["detect_vote_interval"]
+            if not isinstance(value, (int, float)):
+                raise self.server.error("detect_vote_interval must be a number", 400)
+            value = float(value)
+            if value < 0.0:
+                raise self.server.error(
+                    "detect_vote_interval must be at least 0.0", 400
+                )
+            coord_updates["detect_vote_interval"] = value
 
         if not persist_updates and not coord_updates:
             raise self.server.error("No valid configuration parameters provided", 400)
@@ -1586,7 +1614,7 @@ class AIDetectionClient:
             self._is_detecting = False
 
     async def _perform_defect_detection(self) -> None:
-        """执行一轮缺陷检测（连续多次，多数 warning 才报警并暂停）"""
+        """执行一轮缺陷检测（连续多次，多数 is_valid 才报警并暂停）"""
         if not self.is_connected:
             logging.warning(
                 "AI Detection: Not connected for defect detection, skipping..."
@@ -1594,13 +1622,23 @@ class AIDetectionClient:
             return
 
         logging.debug("AI Detection: Performing defect detection...")
-        last_warning_result: Optional[DefectDetectionResult] = None
+        last_defect_result: Optional[DefectDetectionResult] = None
 
         async def _once() -> bool:
-            nonlocal last_warning_result
+            nonlocal last_defect_result
             result = await self._detect_defect_once()
-            if result.warning:
-                last_warning_result = result
+            logging.debug(
+                "AI Detection: Defect detection result - "
+                "is_valid: %s, warning: %s, classes: %s, "
+                "boxes: %s, scores: %s",
+                result.is_valid,
+                result.warning,
+                result.classes,
+                result.boxes,
+                result.scores,
+            )
+            if result.is_valid:
+                last_defect_result = result
                 return True
             return False
 
@@ -1608,23 +1646,24 @@ class AIDetectionClient:
             "Defect detection",
             _once,
             count_exceptions_as_trigger=False,
+            attempt_interval=self.coordinator_config.detect_vote_interval,
         )
 
         if not vote.should_fail:
             logging.debug(
                 "AI Detection: Defect check passed "
-                "(%d/%d attempts warned, below threshold)",
+                "(%d/%d attempts detected, below threshold)",
                 vote.trigger_count,
                 vote.attempts_used,
             )
             return
 
-        result = last_warning_result or DefectDetectionResult(
-            is_valid=False, warning=True
+        result = last_defect_result or DefectDetectionResult(
+            is_valid=True, warning=False
         )
         logging.warning(
             "AI Detection: Defect check failed "
-            "(%d/%d attempts warned) - "
+            "(%d/%d attempts detected) - "
             "Classes: %s, Boxes: %s",
             vote.trigger_count,
             vote.attempts_used,
