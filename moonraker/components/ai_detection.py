@@ -68,6 +68,7 @@ class ClassMappingRegistry:
         0: ClassMapping("spaghetti", "Spaghetti-like defect"),
         1: ClassMapping("zits", "Zits/blobs"),
         2: ClassMapping("stringing", "Stringing"),
+        3: ClassMapping("jitou", "Jitou defect"),
     }
 
     # Default object detection class mappings
@@ -89,6 +90,7 @@ class ClassMappingRegistry:
         配置格式示例:
             defect_class_0: spaghetti, 炒面/意大利面状缺陷
             defect_class_1: zits, 疙瘩/斑点
+            defect_class_3: jitou, 机头缺陷
             object_class_0: object, 底板异物
         """
         # 加载缺陷检测类别
@@ -219,7 +221,7 @@ _SENSITIVITY_LABEL_TO_KEY: Dict[str, str] = {
     "low": "low",
 }
 _OBJECT_CLASS_IDS = ("0", "1", "2")
-_DEFECT_CLASS_IDS = ("0", "1", "2")
+_DEFECT_CLASS_IDS = ("0", "1", "2", "3")
 
 # 检测投票：最多 N 次；累计或连续达到阈值即报错，并支持提前结束
 DETECT_VOTE_ATTEMPTS = 5
@@ -253,6 +255,7 @@ class DefectDetectionResult:
         0 - spaghetti (炒面/意大利面状缺陷)
         1 - zits (疙瘩/斑点)
         2 - stringing (拉丝)
+        3 - jitou
     """
     is_valid: bool
     boxes: List[List[float]] = field(
@@ -1562,7 +1565,8 @@ class AIDetectionClient:
             if self.is_defect_detect_enabled():
                 logging.info(
                     f"AI Detection: Starting defect detection timer "
-                    f"(event: {job_event}, interval: {self.coordinator_config.detect_interval}s)"
+                    f"(event: {job_event}, first check after "
+                    f"{self.coordinator_config.detect_interval}s)"
                 )
                 self._start_defect_timer()
         elif job_event in (JobEvent.PAUSED, JobEvent.COMPLETE,
@@ -1595,17 +1599,18 @@ class AIDetectionClient:
             self._defect_timer = None
 
     async def _defect_detection_loop(self) -> None:
-        """缺陷检测定时循环"""
+        """缺陷检测定时循环：启动后先等待 detect_interval，再执行检测。"""
         try:
             while self._is_detecting:
+                await asyncio.sleep(self.coordinator_config.detect_interval)
+                if not self._is_detecting:
+                    break
                 try:
                     await self._perform_defect_detection()
                 except Exception as e:
                     logging.exception(
                         f"AI Detection: Error in defect detection loop: {e}"
                     )
-
-                await asyncio.sleep(self.coordinator_config.detect_interval)
         except asyncio.CancelledError:
             logging.debug("AI Detection: Defect detection loop cancelled")
         except Exception as e:
