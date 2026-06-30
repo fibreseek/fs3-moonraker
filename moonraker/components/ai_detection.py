@@ -75,7 +75,7 @@ class ClassMappingRegistry:
     DEFAULT_OBJECT_CLASSES: Dict[int, ClassMapping] = {
         0: ClassMapping("object", "Foreign object on bed"),
         1: ClassMapping("hand", "Hand detected"),
-        2: ClassMapping("floor", "Build plate anomaly"),
+        2: ClassMapping("no_build_plate", "Print bed plate not installed marker"),
     }
 
     def __init__(self) -> None:
@@ -223,6 +223,19 @@ _SENSITIVITY_LABEL_TO_KEY: Dict[str, str] = {
 _OBJECT_CLASS_IDS = ("0", "1", "2")
 _DEFECT_CLASS_IDS = ("0", "1", "2", "3")
 
+# class 2：未安装打印板标记；检出 >= MIN 次则确认 build_plate_issue
+BUILD_PLATE_CLASS_ID = 2
+MIN_BUILD_PLATE_DETECTIONS = 2
+BUILD_PLATE_NOT_INSTALLED_MSG = "AI Detection: Build plate not detected"
+
+
+def _count_class(classes: List[int], class_id: int) -> int:
+    return sum(1 for c in classes if c == class_id)
+
+
+def _is_build_plate_issue(classes: List[int]) -> bool:
+    return _count_class(classes, BUILD_PLATE_CLASS_ID) >= MIN_BUILD_PLATE_DETECTIONS
+
 # 检测投票：最多 N 次；累计或连续达到阈值即报错，并支持提前结束
 DETECT_VOTE_ATTEMPTS = 5
 DETECT_VOTE_ERROR_THRESHOLD = 3
@@ -336,7 +349,7 @@ class ObjectDetectionResult:
     scores: List[float] = field(default_factory=list)  # 置信度
     boxes: List[List[float]] = field(default_factory=list)  # 异物目标框
     classes: List[int] = field(default_factory=list)  # 异物所属类别
-    build_plate_issue: bool = False  # 是否检测到底板异常
+    build_plate_issue: bool = False  # 未安装打印板（class 2 标记达到阈值）
 
     @property
     def class_names(self) -> List[str]:
@@ -347,14 +360,13 @@ class ObjectDetectionResult:
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "ObjectDetectionResult":
         classes: List[int] = data.get("classes", []) or []
-        build_plate_issue = 2 in classes
         return cls(
             is_valid=data.get("is_valid", False),
             has_object=data.get("has_object", False),
             scores=data.get("scores", []),
             boxes=data.get("boxes", []),
             classes=classes,
-            build_plate_issue=build_plate_issue,
+            build_plate_issue=_is_build_plate_issue(classes),
         )
 
     def to_dict(self) -> Dict[str, Any]:
@@ -374,7 +386,7 @@ class ObjectDetectionResult:
 class FloorDetectionResult:
     """打印前底板检测结果数据类"""
     is_valid: bool
-    has_build_plate: bool = False
+    build_plate_issue: bool = False  # 未安装打印板（class 2 标记达到阈值）
     scores: List[float] = field(default_factory=list)
     boxes: List[List[float]] = field(default_factory=list)
     classes: List[int] = field(default_factory=list)
@@ -382,10 +394,9 @@ class FloorDetectionResult:
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "FloorDetectionResult":
         classes: List[int] = data.get("classes", []) or []
-        has_build_plate = bool(data.get("has_object", False) or 2 in classes)
         return cls(
             is_valid=data.get("is_valid", False),
-            has_build_plate=has_build_plate,
+            build_plate_issue=_is_build_plate_issue(classes),
             scores=data.get("scores", []),
             boxes=data.get("boxes", []),
             classes=classes,
@@ -394,7 +405,7 @@ class FloorDetectionResult:
     def to_dict(self) -> Dict[str, Any]:
         return {
             "is_valid": self.is_valid,
-            "has_build_plate": self.has_build_plate,
+            "build_plate_issue": self.build_plate_issue,
             "scores": self.scores,
             "boxes": self.boxes,
             "classes": self.classes,
@@ -1113,10 +1124,17 @@ class AIDetectionClient:
         )
         result_data = await self._send_request(DetectionType.FLOOR_DETECT, params)
         result = FloorDetectionResult.from_dict(result_data)
-        if result.has_build_plate:
-            return "ok", None
 
-        return "error", "AI Detection: Build plate not detected"
+        logging.warning(
+            f"AI Detection: Floor detection result - "
+            f"Class: {result.classes}, Box: {result.boxes}, "
+            f"Score: {result.scores}, BuildPlateIssue: {result.build_plate_issue}"
+        )
+
+        if result.build_plate_issue:
+            return "error", BUILD_PLATE_NOT_INSTALLED_MSG
+
+        return "ok", None
 
     async def detect_floor(
         self,
@@ -1137,7 +1155,7 @@ class AIDetectionClient:
             logging.info("AI Detection is disabled, skipping floor detection")
             return "ok"
 
-        last_error_msg = "AI Detection: Build plate not detected"
+        last_error_msg = BUILD_PLATE_NOT_INSTALLED_MSG
 
         async def _once() -> bool:
             nonlocal last_error_msg
@@ -1202,12 +1220,20 @@ class AIDetectionClient:
         )
 
         if result.build_plate_issue:
-            return "error", "AI Detection: Build plate not detected"
+            return "error", BUILD_PLATE_NOT_INSTALLED_MSG
+
+        if 1 in result.classes:
+            return "error", "AI Detection: Hand detected"
+
+        if 0 in result.classes:
+            return "error", "AI Detection: Foreign object detected"
 
         if result.is_valid and result.has_object:
-            if 1 in result.classes:
-                return "error", "AI Detection: Hand detected"
-            return "error", "AI Detection: Foreign object detected"
+            non_floor_classes = [
+                c for c in result.classes if c != BUILD_PLATE_CLASS_ID
+            ]
+            if non_floor_classes or not result.classes:
+                return "error", "AI Detection: Foreign object detected"
 
         return "ok", None
 
