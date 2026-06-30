@@ -227,14 +227,39 @@ _DEFECT_CLASS_IDS = ("0", "1", "2", "3")
 BUILD_PLATE_CLASS_ID = 2
 MIN_BUILD_PLATE_DETECTIONS = 2
 BUILD_PLATE_NOT_INSTALLED_MSG = "AI Detection: Build plate not detected"
+# 单个 class 2 落在此 ROI 内时，等同检出 2 个（x1, y1, x2, y2）
+BUILD_PLATE_SINGLE_MARKER_ROI = (760.0, 650.0, 1012.0, 816.0)
 
 
 def _count_class(classes: List[int], class_id: int) -> int:
     return sum(1 for c in classes if c == class_id)
 
 
-def _is_build_plate_issue(classes: List[int]) -> bool:
-    return _count_class(classes, BUILD_PLATE_CLASS_ID) >= MIN_BUILD_PLATE_DETECTIONS
+def _box_center_in_roi(
+    box: List[float], roi: tuple[float, float, float, float]
+) -> bool:
+    if len(box) < 4:
+        return False
+    cx = (box[0] + box[2]) / 2.0
+    cy = (box[1] + box[3]) / 2.0
+    rx1, ry1, rx2, ry2 = roi
+    return rx1 <= cx <= rx2 and ry1 <= cy <= ry2
+
+
+def _is_build_plate_issue(
+    classes: List[int], boxes: Optional[List[List[float]]] = None
+) -> bool:
+    count = _count_class(classes, BUILD_PLATE_CLASS_ID)
+    if count >= MIN_BUILD_PLATE_DETECTIONS:
+        return True
+    if count != 1 or not boxes:
+        return False
+    for idx, cls_id in enumerate(classes):
+        if cls_id != BUILD_PLATE_CLASS_ID or idx >= len(boxes):
+            continue
+        if _box_center_in_roi(boxes[idx], BUILD_PLATE_SINGLE_MARKER_ROI):
+            return True
+    return False
 
 # 检测投票：最多 N 次；累计或连续达到阈值即报错，并支持提前结束
 DETECT_VOTE_ATTEMPTS = 5
@@ -366,7 +391,8 @@ class ObjectDetectionResult:
             scores=data.get("scores", []),
             boxes=data.get("boxes", []),
             classes=classes,
-            build_plate_issue=_is_build_plate_issue(classes),
+            build_plate_issue=_is_build_plate_issue(
+                classes, data.get("boxes", [])),
         )
 
     def to_dict(self) -> Dict[str, Any]:
@@ -396,7 +422,8 @@ class FloorDetectionResult:
         classes: List[int] = data.get("classes", []) or []
         return cls(
             is_valid=data.get("is_valid", False),
-            build_plate_issue=_is_build_plate_issue(classes),
+            build_plate_issue=_is_build_plate_issue(
+                classes, data.get("boxes", [])),
             scores=data.get("scores", []),
             boxes=data.get("boxes", []),
             classes=classes,
