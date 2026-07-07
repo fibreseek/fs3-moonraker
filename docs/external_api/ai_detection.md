@@ -55,6 +55,7 @@ detect_interval: 10
 defect_class_0: spaghetti, Spaghetti-like defect
 defect_class_1: zits, Zits/blobs
 defect_class_2: stringing, Stringing
+defect_class_3: jitou, Printhead cover detached
 
 object_class_0: object, Foreign object on bed
 object_class_1: hand, Hand detected
@@ -75,7 +76,7 @@ Moonraker 内部会展开成：
 
 - `floor_detect`：标量 `obj_thresh`
 - `object_detect`：`{"0": x, "1": x, "2": x}`
-- `defect_detect`：`{"0": x, "1": x, "2": x}`
+- `defect_detect`：`{"0": x, "1": x, "2": x, "3": x}`
 
 `nms_thresh` 目前固定为内部值，不通过运行时接口对外暴露。
 
@@ -119,7 +120,7 @@ Moonraker 内部会展开成：
     "effective_thresholds": {
       "floor_detect": 0.5,
       "object_detect": {"0": 0.65, "1": 0.65, "2": 0.65},
-      "defect_detect": {"0": 0.8, "1": 0.8, "2": 0.8}
+      "defect_detect": {"0": 0.8, "1": 0.8, "2": 0.8, "3": 0.8}
     },
     "enable": true,
     "enable_floor_detect": true,
@@ -131,7 +132,8 @@ Moonraker 内部会展开成：
     "defect_classes": {
       "0": {"name": "spaghetti", "description": "Spaghetti-like defect"},
       "1": {"name": "zits", "description": "Zits/blobs"},
-      "2": {"name": "stringing", "description": "Stringing"}
+      "2": {"name": "stringing", "description": "Stringing"},
+      "3": {"name": "jitou", "description": "Printhead cover detached"}
     },
     "object_classes": {
       "0": {"name": "object", "description": "Foreign object on bed"},
@@ -199,7 +201,7 @@ Moonraker 内部会展开成：
   "effective_thresholds": {
     "floor_detect": 0.5,
     "object_detect": {"0": 0.65, "1": 0.65, "2": 0.65},
-    "defect_detect": {"0": 0.8, "1": 0.8, "2": 0.8}
+    "defect_detect": {"0": 0.8, "1": 0.8, "2": 0.8, "3": 0.8}
   }
 }
 ```
@@ -290,6 +292,22 @@ Moonraker 会发送：
 }
 ```
 
+#### 打印前缺陷检测失败示例
+
+```json
+{
+  "jsonrpc": "2.0",
+  "method": "notify_ai_detection_detection_result",
+  "params": [
+    {
+      "scenario": "unknown",
+      "detection_type": "defect",
+      "message": "AI Detection: Printhead cover detached"
+    }
+  ]
+}
+```
+
 ## 运行时行为
 
 ### 打印前预检
@@ -298,8 +316,9 @@ Moonraker 在打印前会按下面顺序执行 AI 预检：
 
 1. `floor_detect`
 2. `object_detect`
+3. `defect_detect` class `3` 机头壳脱落检测
 
-如果 `floor_detect` 失败，会直接停止，不再继续执行 `object_detect`。
+如果前置检测失败，会直接停止，不再继续执行后续 AI 预检。
 
 #### 底板检测成功条件
 
@@ -322,6 +341,12 @@ Moonraker 在打印前会按下面顺序执行 AI 预检：
 - `is_valid == true` 且 `has_object == true`，并识别为：
   - 手部
   - 异物
+
+#### 机头壳脱落检测失败条件
+
+打印前机头壳脱落检测复用 `defect_detect`，但只在 `classes` 中包含
+`3` (`jitou`) 时判定失败。`spaghetti`、`zits`、`stringing` 不会在打印前
+机头壳检测阶段阻止打印。
 
 ### 打印中缺陷检测
 

@@ -10,6 +10,7 @@ import os
 import shutil
 from ..utils import Sentinel
 from ..common import WebRequest, APITransport, RequestType
+from .ai_detection import DetectionScenario
 
 # Annotation imports
 from typing import (
@@ -42,6 +43,8 @@ SUBSCRIPTION_ENDPOINT = "objects/subscribe"
 STATUS_ENDPOINT = "objects/query"
 OBJ_LIST_ENDPOINT = "objects/list"
 REG_METHOD_ENDPOINT = "register_remote_method"
+DEFECT_CLASS_ID_JITOU = 3
+JITOU_DEFECT_MSG = "AI Detection: Printhead cover detached"
 
 class KlippyAPI(APITransport):
     def __init__(self, config: ConfigHelper) -> None:
@@ -448,7 +451,7 @@ class KlippyAPI(APITransport):
             #     )
             #     raise self.server.error(msg, 503)
 
-            # 1. 打印前 AI 检测：先底板，再异物检测
+            # 1. 打印前 AI 检测：先底板，再异物，最后用缺陷检测 class 3 检查机头壳
             try:
                 if skip_foreign_detect:
                     logging.info(
@@ -485,9 +488,51 @@ class KlippyAPI(APITransport):
                                 msg = ("AI Detection: Object detection failed, skipping print")
                                 logging.warning(msg)
                                 raise self.server.error(msg, 403)
-                            logging.info("AI Detection: No objects detected, proceeding with print")
+                            logging.info("AI Detection: No objects detected, proceeding to printhead cover detection")
                         else:
                             logging.info("AI Detection: Object detection disabled, skipping...")
+
+                        if ai_detection.is_defect_detect_enabled():
+                            last_defect_result = None
+
+                            async def _detect_defect_for_precheck() -> bool:
+                                nonlocal last_defect_result
+                                result = await ai_detection.detect_defect()
+                                last_defect_result = result
+                                logging.warning(
+                                    "AI Detection: Preprint defect detection result - "
+                                    "Class: %s, Box: %s, Score: %s",
+                                    result.classes,
+                                    result.boxes,
+                                    result.scores,
+                                )
+                                return DEFECT_CLASS_ID_JITOU in result.classes
+
+                            vote = await ai_detection._run_vote_detection_round(
+                                "Defect detection",
+                                _detect_defect_for_precheck,
+                                count_exceptions_as_trigger=False,
+                            )
+
+                            if vote.should_fail:
+                                if last_defect_result is not None:
+                                    logging.warning(
+                                        "AI Detection: Printhead cover detached - "
+                                        "Classes: %s, Boxes: %s",
+                                        last_defect_result.classes,
+                                        last_defect_result.boxes,
+                                )
+                                ai_detection._send_detection_notification(
+                                    scenario=DetectionScenario.UNKNOWN,
+                                    detection_type="defect",
+                                    message=JITOU_DEFECT_MSG,
+                                )
+                                msg = ("AI Detection: Printhead cover check failed, skipping print")
+                                logging.warning(msg)
+                                raise self.server.error(msg, 403)
+                            logging.info("AI Detection: Printhead cover check passed, proceeding with print")
+                        else:
+                            logging.info("AI Detection: Printhead cover detection disabled, skipping...")
             except self.server.error:
                 raise
             except Exception as e:
