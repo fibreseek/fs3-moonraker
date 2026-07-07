@@ -311,7 +311,7 @@ class KlippyAPI(APITransport):
 
         # Escape existing double quotes in the file name
         filename_only = filename_only.replace("\"", "\\\"")
-        script = f'SDCARD_PRINT_FILE FILENAME="{filename_only}"'
+        script = f'SDCARD_PRINT_FILE FILENAME="{filename_with_path}"'
         if wait_klippy_started:
             await self.klippy.wait_started()
         logging.info(f"Requesting Job Start, filename_with_path = {filename_with_path}, filename_only = {filename_only}")
