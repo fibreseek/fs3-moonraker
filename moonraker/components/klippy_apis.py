@@ -10,6 +10,7 @@ import os
 import shutil
 from ..utils import Sentinel
 from ..common import WebRequest, APITransport, RequestType
+from .ai_detection import DetectionScenario
 
 # Annotation imports
 from typing import (
@@ -42,6 +43,8 @@ SUBSCRIPTION_ENDPOINT = "objects/subscribe"
 STATUS_ENDPOINT = "objects/query"
 OBJ_LIST_ENDPOINT = "objects/list"
 REG_METHOD_ENDPOINT = "register_remote_method"
+DEFECT_CLASS_ID_JITOU = 3
+JITOU_DEFECT_MSG = "AI Detection: Printhead cover detached"
 
 class KlippyAPI(APITransport):
     def __init__(self, config: ConfigHelper) -> None:
@@ -120,12 +123,13 @@ class KlippyAPI(APITransport):
         logging.info(" enter _gcode_start_print")
         filename: str = web_request.get_str('filename')
         user = web_request.get_current_user()
-        auto_leveling: bool = web_request.get_boolean('auto_leveling', False)
-        timelapse: bool = web_request.get_boolean('timelapse', False)
-        # 兼容旧客户端：仅跳过 AI 预检，不影响耗材等其他预检
-        skip_foreign_detect: bool = web_request.get_boolean(
-            'skip_foreign_detect', False
+        auto_leveling: Optional[bool] = web_request.get_boolean(
+            'auto_leveling', None
         )
+        skip_foreign_detect: Optional[bool] = web_request.get_boolean(
+            'skip_foreign_detect', None
+        )
+        timelapse: Optional[bool] = web_request.get_boolean('timelapse', None)
         # 是否跳过整个预检查流程（包括 AI、传感器等），主要用于用户确认后“忽略并继续”
         skip_precheck: bool = web_request.get_boolean('skip_precheck', False)
 
@@ -202,9 +206,9 @@ class KlippyAPI(APITransport):
         filename: str,
         wait_klippy_started: bool = False,
         user: Optional[UserInfo] = None,
-        auto_leveling: bool = False,
-        timelapse: bool = False,
-        skip_foreign_detect: bool = False,
+        auto_leveling: Optional[bool] = None,
+        timelapse: Optional[bool] = None,
+        skip_foreign_detect: Optional[bool] = None,
         skip_precheck: bool = False,
     ) -> str:
         # WARNING: Do not call this method from within the following
@@ -219,6 +223,47 @@ class KlippyAPI(APITransport):
 
         await self._validate_print_start_state()
         self.klippy.reset_auto_recovery("print start")
+
+        if auto_leveling is None:
+            auto_leveling = await self._get_database_bool(
+                "fibretouch", "autoLevelingEnabled", False
+            )
+        if timelapse is None:
+            timelapse = await self._get_database_bool(
+                "fibretouch", "timeLapseEnabled", False
+            )
+        if skip_foreign_detect is None:
+            ai_enabled = await self._get_database_bool(
+                "ai_detection", ["coordinator_config", "enable"], True
+            )
+            skip_foreign_detect = not ai_enabled
+
+        try:
+            ai_detection = self.server.lookup_component("ai_detection")
+            target_enable = not skip_foreign_detect
+            if ai_detection.is_enabled() != target_enable:
+                logging.info(
+                    "AI Detection: syncing persistent enable to %s due to "
+                    "skip_foreign_detect=%s",
+                    target_enable,
+                    skip_foreign_detect,
+                )
+                await ai_detection.set_enabled(target_enable)
+        except Exception as e:
+            logging.warning(
+                "AI Detection: failed to sync persistent enable from "
+                "skip_foreign_detect=%s: %s",
+                skip_foreign_detect,
+                e,
+            )
+
+        logging.info(
+            "Print start options: auto_leveling=%s, timelapse=%s, "
+            "skip_foreign_detect=%s",
+            auto_leveling,
+            timelapse,
+            skip_foreign_detect,
+        )
 
         # 保存带子文件夹路径的文件名，用于 SAVE_VARIABLE
         filename_with_path = filename
@@ -280,27 +325,6 @@ class KlippyAPI(APITransport):
             except Exception as e:
                 logging.warning(f"Failed to execute command '{cmd}': {e}")
 
-        # 按兼容参数同步持久化的 AI 总开关：skip_foreign_detect=true 时关闭，
-        # false 时重新开启，保持上位机与 Moonraker 的打印前状态一致。
-        try:
-            ai_detection = self.server.lookup_component("ai_detection")
-            target_enable = not skip_foreign_detect
-            if ai_detection.is_enabled() != target_enable:
-                logging.info(
-                    "AI Detection: syncing persistent enable to %s due to "
-                    "skip_foreign_detect=%s",
-                    target_enable,
-                    skip_foreign_detect,
-                )
-                await ai_detection.set_enabled(target_enable)
-        except Exception as e:
-            logging.warning(
-                "AI Detection: failed to sync persistent enable from "
-                "skip_foreign_detect=%s: %s",
-                skip_foreign_detect,
-                e,
-            )
-
         # 打印前预检查（AI / 传感器等）
         if not skip_precheck:
             await self._run_precheck(
@@ -311,7 +335,7 @@ class KlippyAPI(APITransport):
 
         # Escape existing double quotes in the file name
         filename_only = filename_only.replace("\"", "\\\"")
-        script = f'SDCARD_PRINT_FILE FILENAME="{filename_only}"'
+        script = f'SDCARD_PRINT_FILE FILENAME="{filename_with_path}"'
         if wait_klippy_started:
             await self.klippy.wait_started()
         logging.info(f"Requesting Job Start, filename_with_path = {filename_with_path}, filename_only = {filename_only}")
@@ -320,6 +344,22 @@ class KlippyAPI(APITransport):
         self.server.send_event("klippy_apis:job_start_complete", user)
         logging.info(" leave start_print")
         return ret
+
+    async def _get_database_bool(
+        self, namespace: str, key: Union[str, List[str]], default: bool
+    ) -> bool:
+        try:
+            database = self.server.lookup_component("database")
+            value = await database.get_item(namespace, key, default)
+        except Exception as e:
+            logging.debug(
+                "Unable to read database default %s.%s: %s",
+                namespace,
+                ".".join(key) if isinstance(key, list) else key,
+                e,
+            )
+            return default
+        return value if isinstance(value, bool) else default
 
     async def _validate_print_start_state(self) -> None:
         """
@@ -411,7 +451,7 @@ class KlippyAPI(APITransport):
             #     )
             #     raise self.server.error(msg, 503)
 
-            # 1. 打印前 AI 检测：先底板，再异物检测
+            # 1. 打印前 AI 检测：先底板，再异物，最后用缺陷检测 class 3 检查机头壳
             try:
                 if skip_foreign_detect:
                     logging.info(
@@ -448,9 +488,51 @@ class KlippyAPI(APITransport):
                                 msg = ("AI Detection: Object detection failed, skipping print")
                                 logging.warning(msg)
                                 raise self.server.error(msg, 403)
-                            logging.info("AI Detection: No objects detected, proceeding with print")
+                            logging.info("AI Detection: No objects detected, proceeding to printhead cover detection")
                         else:
                             logging.info("AI Detection: Object detection disabled, skipping...")
+
+                        if ai_detection.is_defect_detect_enabled():
+                            last_defect_result = None
+
+                            async def _detect_defect_for_precheck() -> bool:
+                                nonlocal last_defect_result
+                                result = await ai_detection.detect_defect()
+                                last_defect_result = result
+                                logging.warning(
+                                    "AI Detection: Preprint defect detection result - "
+                                    "Class: %s, Box: %s, Score: %s",
+                                    result.classes,
+                                    result.boxes,
+                                    result.scores,
+                                )
+                                return DEFECT_CLASS_ID_JITOU in result.classes
+
+                            vote = await ai_detection._run_vote_detection_round(
+                                "Defect detection",
+                                _detect_defect_for_precheck,
+                                count_exceptions_as_trigger=False,
+                            )
+
+                            if vote.should_fail:
+                                if last_defect_result is not None:
+                                    logging.warning(
+                                        "AI Detection: Printhead cover detached - "
+                                        "Classes: %s, Boxes: %s",
+                                        last_defect_result.classes,
+                                        last_defect_result.boxes,
+                                )
+                                ai_detection._send_detection_notification(
+                                    scenario=DetectionScenario.UNKNOWN,
+                                    detection_type="defect",
+                                    message=JITOU_DEFECT_MSG,
+                                )
+                                msg = ("AI Detection: Printhead cover check failed, skipping print")
+                                logging.warning(msg)
+                                raise self.server.error(msg, 403)
+                            logging.info("AI Detection: Printhead cover check passed, proceeding with print")
+                        else:
+                            logging.info("AI Detection: Printhead cover detection disabled, skipping...")
             except self.server.error:
                 raise
             except Exception as e:

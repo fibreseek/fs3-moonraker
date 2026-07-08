@@ -2,6 +2,7 @@ import logging
 import re
 import os
 import time
+import base64
 from typing import Dict, Any, List, Optional, Tuple
 
 from ..confighelper import ConfigHelper
@@ -12,6 +13,10 @@ from ..utils import ServerError
 DB_NAMESPACE = "moonraker"
 WEBHOOK_ERROR_STATES = ("shutdown", "error")
 PLACEHOLDER_RE = re.compile(r"%(\d+)")
+AI_ERROR_IMAGE_RE = re.compile(
+    r"^(print|floor|object)_error_\d+_(\d{14})\.jpg$",
+    re.IGNORECASE
+)
 DEFAULT_LANGUAGE = "en-US"
 COMMON_SHEET_NAME = "common"
 
@@ -571,6 +576,10 @@ class ErrorIndexer:
             f"ai_detection:detection_result "
             f"scenario={scenario}, detection_type={detection_type}, message={message}"
         )
+        image_payload = self._build_ai_error_image_payload(
+            scenario=scenario,
+            detection_type=detection_type,
+        )
 
         # 优先在 AI sheet 中进行错误码匹配
         match_result = self._match_error_code_in_db(message, self.ai_error_db) \
@@ -584,6 +593,7 @@ class ErrorIndexer:
                 code=code,
                 placeholder_values=groups,
                 error_db=self.ai_error_db,
+                extra_payload=image_payload,
             )
         else:
             # 未匹配到时仍然走统一流程，但使用 AI 错误库，
@@ -592,7 +602,88 @@ class ErrorIndexer:
                 message,
                 original_response,
                 error_db=self.ai_error_db,
+                extra_payload=image_payload,
             )
+
+    def _resolve_ai_image_type(
+        self, scenario: str, detection_type: str
+    ) -> Optional[str]:
+        """Map AI detection event metadata to the ai_errors filename prefix."""
+        scenario_key = (scenario or "").strip().lower()
+        detection_key = (detection_type or "").strip().lower()
+        if detection_key == "floor":
+            return "floor"
+        if detection_key == "object":
+            return "object"
+        if detection_key in ("defect", "print") \
+                or scenario_key == "printing_defect_periodic":
+            return "print"
+        return None
+
+    def _find_latest_ai_error_image(
+        self, image_type: str
+    ) -> Optional[Tuple[str, str]]:
+        """Return (filename, absolute_path) for the newest saved AI error image."""
+        data_path = self.server.get_app_args().get("data_path", "")
+        if not data_path:
+            return None
+        image_dir = os.path.join(data_path, "logs", "ai_errors")
+        if not os.path.isdir(image_dir):
+            logging.debug("Error Indexer: AI error image dir not found: %s", image_dir)
+            return None
+
+        latest: Optional[Tuple[str, str, str]] = None
+        try:
+            for filename in os.listdir(image_dir):
+                match = AI_ERROR_IMAGE_RE.fullmatch(filename)
+                if not match:
+                    continue
+                if match.group(1).lower() != image_type:
+                    continue
+                timestamp = match.group(2)
+                path = os.path.join(image_dir, filename)
+                if not os.path.isfile(path):
+                    continue
+                if latest is None or timestamp > latest[0]:
+                    latest = (timestamp, filename, path)
+        except OSError as e:
+            logging.warning(
+                "Error Indexer: Failed to scan AI error image dir %s: %s",
+                image_dir, e
+            )
+            return None
+
+        if latest is None:
+            return None
+        return latest[1], latest[2]
+
+    def _build_ai_error_image_payload(
+        self, scenario: str, detection_type: str
+    ) -> Dict[str, Any]:
+        image_type = self._resolve_ai_image_type(scenario, detection_type)
+        if not image_type:
+            return {}
+        image_info = self._find_latest_ai_error_image(image_type)
+        if image_info is None:
+            return {}
+
+        image_name, image_path = image_info
+        try:
+            with open(image_path, "rb") as f:
+                image_base64 = base64.b64encode(f.read()).decode("ascii")
+        except OSError as e:
+            logging.warning(
+                "Error Indexer: Failed to read AI error image %s: %s",
+                image_path, e
+            )
+            return {}
+
+        return {
+            "image_base64": image_base64,
+            "image_mime": "image/jpeg",
+            "image_name": image_name,
+            "image_type": image_type,
+        }
 
     def _is_duplicate_error(self, error_msg: str) -> bool:
         """Return True if the same error message was notified within dedup_interval."""
@@ -615,6 +706,7 @@ class ErrorIndexer:
         code: Optional[str] = None,
         placeholder_values: Optional[Tuple[str, ...]] = None,
         error_db: Optional[Dict[str, Dict[str, Any]]] = None,
+        extra_payload: Optional[Dict[str, Any]] = None,
     ) -> None:
         """Process detected error."""
         db = error_db or self.error_db
@@ -659,6 +751,8 @@ class ErrorIndexer:
             "solution_link": solution,
             "original_response": original_response
         }
+        if extra_payload:
+            payload.update(extra_payload)
 
         self.server.send_event("error_indexer:error_detected", payload)
         logging.info(f"Error Indexer: Error detected and notification sent: {code} - {error_msg}")
