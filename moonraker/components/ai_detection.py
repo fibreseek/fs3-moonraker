@@ -209,10 +209,22 @@ class DetectionParams:
 
 
 # 上位机三档灵敏度：对应下发给 AI 服务的 obj_thresh（置信度门槛）
-SENSITIVITY_OBJ_THRESH: Dict[str, float] = {
+FLOOR_SENSITIVITY_OBJ_THRESH: Dict[str, float] = {
     "high": 0.35,
     "medium": 0.55,
     "low": 0.7,
+}
+
+OBJECT_SENSITIVITY_OBJ_THRESH: Dict[str, float] = {
+    "high": 0.35,
+    "medium": 0.55,
+    "low": 0.7,
+}
+
+DEFECT_SENSITIVITY_OBJ_THRESH: Dict[str, float] = {
+    "high": 0.35,
+    "medium": 0.55,
+    "low": 0.8,
 }
 
 _SENSITIVITY_LABEL_TO_KEY: Dict[str, str] = {
@@ -615,24 +627,35 @@ class AIDetectionClient:
         timestamp = int(time.time() * 1000)
         return f"{detection_type.value}_{self._request_counter}_{timestamp}"
 
-    def _resolve_threshold(self, override: Optional[float], sensitivity: str) -> float:
+    def _resolve_threshold(
+        self,
+        override: Optional[float],
+        sensitivity: str,
+        thresholds: Dict[str, float],
+    ) -> float:
         if override is not None:
             return float(override)
-        return SENSITIVITY_OBJ_THRESH[sensitivity]
+        return thresholds[sensitivity]
 
     def _effective_floor_obj_thresh(self, override: Optional[float] = None) -> float:
-        return self._resolve_threshold(override, self.floor_sensitivity)
+        return self._resolve_threshold(
+            override, self.floor_sensitivity, FLOOR_SENSITIVITY_OBJ_THRESH
+        )
 
     def _effective_object_obj_thresh(
         self, override: Optional[float] = None
     ) -> Dict[str, float]:
-        threshold = self._resolve_threshold(override, self.object_sensitivity)
+        threshold = self._resolve_threshold(
+            override, self.object_sensitivity, OBJECT_SENSITIVITY_OBJ_THRESH
+        )
         return _expand_threshold(threshold, _OBJECT_CLASS_IDS)
 
     def _effective_defect_obj_thresh(
         self, override: Optional[float] = None
     ) -> Dict[str, float]:
-        threshold = self._resolve_threshold(override, self.defect_sensitivity)
+        threshold = self._resolve_threshold(
+            override, self.defect_sensitivity, DEFECT_SENSITIVITY_OBJ_THRESH
+        )
         return _expand_threshold(threshold, _DEFECT_CLASS_IDS)
 
     def _effective_thresholds(self) -> Dict[str, Any]:
