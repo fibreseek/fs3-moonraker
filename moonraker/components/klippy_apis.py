@@ -327,10 +327,14 @@ class KlippyAPI(APITransport):
 
         # 打印前预检查（AI / 传感器等）
         if not skip_precheck:
+            door_open_pause_enabled = await self._get_database_bool(
+                "fibretouch", "doorOpenPauseEnabled", False
+            )
             await self._run_precheck(
                 skip_foreign_detect=skip_foreign_detect,
                 print_mode=print_mode,
                 chamber_temp=chamber_temp,
+                door_open_pause_enabled=door_open_pause_enabled,
             )
 
         # Escape existing double quotes in the file name
@@ -394,6 +398,7 @@ class KlippyAPI(APITransport):
         skip_foreign_detect: bool = False,
         print_mode: int = -1,
         chamber_temp: float = 0.0,
+        door_open_pause_enabled: bool = False,
     ) -> None:
         """
         打印前预检查流程入口。
@@ -402,7 +407,6 @@ class KlippyAPI(APITransport):
           - 打印底板安放检测（AI）
           - AI 平台异物检测
           - 耗材存在检测（传感器，基于 print_mode 检查对应耗材传感器）
-        预留扩展：
           - 加热腔门/顶盖关闭检测
 
         前端接口（供上位机如 anisotouch-sk3 后续接入）：
@@ -425,6 +429,12 @@ class KlippyAPI(APITransport):
             logging.warning(f"Precheck: failed to set print state to precheck: {e}")
 
         try:
+            # 0. 门检测：开门暂停开启时独立于腔温执行；保留腔温打印的既有检测。
+            await self._run_enclosure_door_precheck(
+                chamber_temp=chamber_temp,
+                door_open_pause_enabled=door_open_pause_enabled,
+            )
+
             # # 0. 打印前准备：归位、移动到清洁位置等，供后续 AI 检测使用
             # try:
             #     logging.info("Precheck: running PREPARE_PRINTING...")
@@ -641,46 +651,6 @@ class KlippyAPI(APITransport):
                 except Exception as e:
                     logging.warning(f"Filament precheck: failed: {e}, proceeding with print anyway")
 
-            # 4. 加热腔门/顶盖检测
-            try:
-                if not chamber_temp or chamber_temp <= 0.0:
-                    logging.info("Enclosure precheck: no chamber temperature configured, skipping door/top cover check")
-                else:
-                    # 查询门传感器状态
-                    try:
-                        status = await self.query_objects(
-                            {"filament_switch_sensor door_hall_sensor": None}
-                        )
-                    except Exception as e:
-                        logging.warning(f"Enclosure precheck: failed to query door_hall_sensor: {e}, proceeding with print anyway")
-                    else:
-                        obj = status.get("filament_switch_sensor door_hall_sensor", {})
-                        door_closed = bool(obj.get("filament_detected", True))
-                        enabled = bool(obj.get("enabled", True))
-
-                        if enabled and not door_closed:
-                            msg = "Door is not closed with the chamber temperature"
-                            logging.warning(msg)
-                            self.server.send_event(
-                                "precheck:failed",
-                                {
-                                    "message": msg,
-                                    "step": "enclosure_door",
-                                    "http_code": 403,
-                                    "data": {
-                                        "sensor": "filament_switch_sensor door_hall_sensor",
-                                        "chamber_temp": chamber_temp,
-                                    },
-                                },
-                            )
-                            raise self.server.error("enclosure_door", 403)
-                        else:
-                            logging.info("Enclosure precheck: door and top cover are closed, proceeding with print")
-            except self.server.error:
-                logging.warning("Precheck failed on enclosure check")
-                raise
-            except Exception as e:
-                logging.warning(f"Enclosure precheck: check failed: {e}, proceeding with print")
         except self.server.error:
             # 预检查失败时，将 print_stats.state 恢复为 standby，避免长时间停留在 precheck/error 状态
             try:
@@ -688,6 +658,62 @@ class KlippyAPI(APITransport):
             except Exception as e:
                 logging.warning(f"Precheck: failed to reset print_stats.state to standby: {e}")
             raise
+
+    async def _run_enclosure_door_precheck(
+        self,
+        chamber_temp: float,
+        door_open_pause_enabled: bool,
+    ) -> None:
+        """Check the enclosure door once for both chamber and door-pause policies."""
+        if not door_open_pause_enabled and (not chamber_temp or chamber_temp <= 0.0):
+            logging.info(
+                "Enclosure precheck: no chamber temperature configured and "
+                "door-open pause is disabled, skipping door/top cover check"
+            )
+            return
+
+        try:
+            status = await self.query_objects(
+                {"filament_switch_sensor door_hall_sensor": None}
+            )
+            obj = status.get("filament_switch_sensor door_hall_sensor", {})
+            door_closed = bool(obj.get("filament_detected", True))
+            enabled = bool(obj.get("enabled", True))
+        except Exception as e:
+            logging.warning(
+                "Enclosure precheck: failed to query door_hall_sensor: %s, "
+                "proceeding with print anyway",
+                e,
+            )
+            return
+
+        if not enabled:
+            logging.info("Enclosure precheck: door_hall_sensor is disabled, proceeding with print")
+            return
+        if door_closed:
+            logging.info("Enclosure precheck: door and top cover are closed, proceeding with print")
+            return
+
+        if door_open_pause_enabled:
+            message = "Chamber door is open."
+            step = "door_open_pause"
+        else:
+            message = "Door is not closed with the chamber temperature"
+            step = "enclosure_door"
+
+        logging.warning(message)
+        payload: Dict[str, Any] = {
+            "message": message,
+            "step": step,
+            "http_code": 403,
+            "data": {
+                "sensor": "filament_switch_sensor door_hall_sensor",
+                "chamber_temp": chamber_temp,
+            },
+        }
+        self.server.send_event("precheck:failed", payload)
+        raise self.server.error(step, 403)
+
     def _parse_print_mode(self, mode_str: str) -> int:
         """
         解析打印模式字符串为数值
