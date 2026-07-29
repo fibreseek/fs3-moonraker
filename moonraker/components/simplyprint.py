@@ -550,7 +550,7 @@ class SimplyPrint(APITransport):
             for htr in avail_htrs:
                 if htr.startswith("extruder"):
                     sub_objs[htr] = ["temperature", "target"]
-                    if htr == "extruder":
+                    if htr == "extruder" or htr == "extruder2":
                         tool_id = "tool0"
                     else:
                         tool_id = "tool" + htr[8:]
@@ -1012,7 +1012,7 @@ class SimplyPrint(APITransport):
             )
 
     def _send_active_extruder(self, new_extruder: str):
-        tool = "T0" if new_extruder == "extruder" else f"T{new_extruder[8:]}"
+        tool = "T0" if new_extruder == "extruder" or new_extruder == "extruder2" else f"T{new_extruder[8:]}"
         if tool == self.cache.active_extruder:
             return
         self.cache.active_extruder = tool
