@@ -115,6 +115,20 @@ def regex_find_string(pattern: str, data: str) -> Optional[str]:
         return match.group(1).strip('"')
     return None
 
+def fsync_path(path: str) -> None:
+    # 缩略图写完后设备可能立刻被断电，不刷到存储介质会留下 0 字节 PNG
+    try:
+        fd = os.open(path, os.O_RDONLY)
+    except OSError:
+        logger.info(f"Unable to open for fsync: {path}")
+        return
+    try:
+        os.fsync(fd)
+    except OSError:
+        logger.info(f"Unable to fsync: {path}")
+    finally:
+        os.close(fd)
+
 def regex_find_min_float(pattern: str, data: str) -> Optional[float]:
     result = regex_find_floats(pattern, data)
     return min(result) if result else None
@@ -302,6 +316,8 @@ class BaseSlicer(object):
                 rel_thumb_path = os.path.join(".thumbs", thumb_name)
             with open(thumb_path, "wb") as f:
                 f.write(base64.b64decode(data.encode()))
+                f.flush()
+                os.fsync(f.fileno())
             parsed_matches.append({
                 'width': info[0], 'height': info[1],
                 'size': os.path.getsize(thumb_path),
@@ -330,6 +346,7 @@ class BaseSlicer(object):
                     # Create 32x32 thumbnail
                     im.thumbnail((32, 32))
                     im.save(thumb_path_small, format="PNG")
+                    fsync_path(thumb_path_small)
                     parsed_matches.insert(0, {
                         'width': im.width, 'height': im.height,
                         'size': os.path.getsize(thumb_path_small),
@@ -338,6 +355,9 @@ class BaseSlicer(object):
                     })
             except Exception as e:
                 logger.info(str(e))
+        if parsed_matches:
+            # 目录项同样需要落盘，否则断电后可能连文件名都不存在
+            fsync_path(thumb_dir)
         return parsed_matches
 
     def parse_layer_count(self) -> Optional[int]:
@@ -706,6 +726,8 @@ class Cura(BaseSlicer):
                 # Create 32x32 thumbnail
                 im.thumbnail((32, 32), Image.Resampling.LANCZOS)
                 im.save(thumb_path_small, format="PNG")
+                fsync_path(thumb_path_small)
+                fsync_path(thumb_dir)
                 thumbs.insert(0, {
                     'width': im.width, 'height': im.height,
                     'size': os.path.getsize(thumb_path_small),
