@@ -325,7 +325,7 @@ class KlippyAPI(APITransport):
             except Exception as e:
                 logging.warning(f"Failed to execute command '{cmd}': {e}")
 
-        # 打印前预检查（AI / 传感器等）
+        # 打印前预检查（AI / 传感器 / 材料匹配等）
         if not skip_precheck:
             door_open_pause_enabled = await self._get_database_bool(
                 "fibretouch", "doorOpenPauseEnabled", False
@@ -335,6 +335,7 @@ class KlippyAPI(APITransport):
                 print_mode=print_mode,
                 chamber_temp=chamber_temp,
                 door_open_pause_enabled=door_open_pause_enabled,
+                metadata=metadata if metadata else None,
             )
 
         # Escape existing double quotes in the file name
@@ -399,6 +400,7 @@ class KlippyAPI(APITransport):
         print_mode: int = -1,
         chamber_temp: float = 0.0,
         door_open_pause_enabled: bool = False,
+        metadata: Optional[Dict[str, Any]] = None,
     ) -> None:
         """
         打印前预检查流程入口。
@@ -407,6 +409,7 @@ class KlippyAPI(APITransport):
           - 打印底板安放检测（AI）
           - AI 平台异物检测
           - 耗材存在检测（传感器，基于 print_mode 检查对应耗材传感器）
+          - 材料名匹配检测（gcode metadata 与 material_manager 料卷）
           - 加热腔门/顶盖关闭检测
 
         前端接口（供上位机如 anisotouch-sk3 后续接入）：
@@ -651,6 +654,10 @@ class KlippyAPI(APITransport):
                 except Exception as e:
                     logging.warning(f"Filament precheck: failed: {e}, proceeding with print anyway")
 
+            # 3. 材料名匹配检测（gcode 期望材料 vs material_manager 当前料卷）
+            # step=material_mismatch，与传感器缺料 step=filament 区分；详情放 data。
+            await self._run_material_match_precheck(print_mode, metadata)
+
         except self.server.error:
             # 预检查失败时，将 print_stats.state 恢复为 standby，避免长时间停留在 precheck/error 状态
             try:
@@ -658,6 +665,123 @@ class KlippyAPI(APITransport):
             except Exception as e:
                 logging.warning(f"Precheck: failed to reset print_stats.state to standby: {e}")
             raise
+
+    async def _run_material_match_precheck(
+        self,
+        print_mode: int,
+        metadata: Optional[Dict[str, Any]],
+    ) -> None:
+        """按 print_mode 比对 gcode 材料名与机上料卷；不匹配则拒绝本次 start_print。"""
+        if print_mode < 0:
+            logging.info(
+                "Material match precheck: invalid or missing print_mode, skipping"
+            )
+            return
+        if not metadata:
+            logging.info("Material match precheck: no metadata, skipping")
+            return
+
+        material_manager = self.server.lookup_component("material_manager", None)
+        if material_manager is None:
+            logging.info(
+                "Material match precheck: material_manager not loaded, skipping"
+            )
+            return
+        if not getattr(material_manager, "enabled", False):
+            logging.info(
+                "Material match precheck: material_manager disabled, skipping"
+            )
+            return
+
+        # print_mode → (通道展示文案, metadata 字段, spool_id)
+        # 0 Plastic Only: p1 ↔ P2
+        # 1 Plastic+Composite: p0↔P1 + f0↔F + p1↔P2（与缺料传感器三路一致；某通道名为空则跳过该通道）
+        # 2 Composite Only: f0↔F + p0↔P1（与缺料传感器口径一致，复合挤出需塑料包覆）
+        channel_checks: List[tuple] = []
+        if print_mode == 0:
+            channel_checks = [
+                ("Right plastic", "p1_filament_name", "P2"),
+            ]
+        elif print_mode == 1:
+            channel_checks = [
+                ("Left plastic", "p0_filament_name", "P1"),
+                ("Fiber", "f0_filament_name", "F"),
+                ("Right plastic", "p1_filament_name", "P2"),
+            ]
+        elif print_mode == 2:
+            channel_checks = [
+                ("Fiber", "f0_filament_name", "F"),
+                ("Left plastic", "p0_filament_name", "P1"),
+            ]
+        else:
+            logging.info(
+                "Material match precheck: unsupported print_mode=%s, skipping",
+                print_mode,
+            )
+            return
+
+        def _normalize(name: str) -> str:
+            return name.strip().lower()
+
+        def _names_compatible(expected: str, loaded: str) -> bool:
+            """机上材料名是需求名的子集（含相等）即通过，如 now=pla、need=pla-x。"""
+            e = _normalize(expected)
+            l = _normalize(loaded)
+            if not e or not l:
+                return False
+            return l in e
+
+        mismatches: List[Dict[str, str]] = []
+        try:
+            for label, meta_key, spool_id in channel_checks:
+                expected = str(metadata.get(meta_key) or "").strip()
+                if not expected:
+                    continue
+                loaded = str(
+                    material_manager.get_spool_material_name(spool_id) or ""
+                ).strip()
+                if _names_compatible(expected, loaded):
+                    continue
+                loaded_display = loaded if loaded else "none"
+                mismatches.append(
+                    {
+                        "channel": spool_id,
+                        "label": label,
+                        "expected": expected,
+                        "loaded": loaded_display,
+                    }
+                )
+        except Exception as e:
+            logging.warning(
+                "Material match precheck: failed to read spool materials: %s, "
+                "proceeding with print anyway",
+                e,
+            )
+            return
+
+        if not mismatches:
+            logging.info("Material match precheck: all required channels match")
+            return
+
+        # message 稳定供 error_indexer / xlsx 匹配；通道明细只放 data
+        msg = "Material mismatch"
+        logging.warning(
+            "Material match precheck failed: %s mismatches=%s", msg, mismatches
+        )
+        self.server.send_event(
+            "precheck:failed",
+            {
+                "message": msg,
+                "step": "material_mismatch",
+                "http_code": 403,
+                "data": {
+                    "print_mode": print_mode,
+                    "material_mismatches": mismatches,
+                },
+            },
+        )
+        # 403 仅表示 start_print RPC 失败；业务弹窗走 error_indexer 通知
+        raise self.server.error("material_mismatch", 403)
 
     async def _run_enclosure_door_precheck(
         self,
