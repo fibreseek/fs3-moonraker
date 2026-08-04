@@ -222,8 +222,8 @@ OBJECT_SENSITIVITY_OBJ_THRESH: Dict[str, float] = {
 }
 
 DEFECT_SENSITIVITY_OBJ_THRESH: Dict[str, float] = {
-    "high": 0.35,
-    "medium": 0.55,
+    "high": 0.6,
+    "medium": 0.7,
     "low": 0.8,
 }
 
