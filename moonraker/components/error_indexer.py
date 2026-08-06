@@ -553,9 +553,12 @@ class ErrorIndexer:
                 original_response,
                 code=code,
                 placeholder_values=groups,
+                skip_dedup=True,
             )
         else:
-            self._process_error(message, original_response, None)
+            self._process_error(
+                message, original_response, None, skip_dedup=True
+            )
 
     def _handle_ai_detection_result(self, payload: Dict[str, Any]) -> None:
         """处理来自 ai_detection 组件的检测结果事件。
@@ -756,6 +759,7 @@ class ErrorIndexer:
         placeholder_values: Optional[Tuple[str, ...]] = None,
         error_db: Optional[Dict[str, Dict[str, Any]]] = None,
         extra_payload: Optional[Dict[str, Any]] = None,
+        skip_dedup: bool = False,
     ) -> None:
         """Process detected error."""
         db = error_db or self.error_db
@@ -766,7 +770,8 @@ class ErrorIndexer:
                 code, placeholder_values = match_result
         if not code:
             code = "UNKNOWN"
-        if self._is_duplicate_error(error_msg):
+        # 预检失败与用户点击 1:1，不能按短窗口去重，否则再次点打印不弹窗
+        if not skip_dedup and self._is_duplicate_error(error_msg):
             logging.debug(
                 "Error Indexer: Suppressed duplicate error within %.1fs: %s",
                 self.dedup_interval, error_msg
