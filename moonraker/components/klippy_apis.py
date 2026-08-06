@@ -337,6 +337,15 @@ class KlippyAPI(APITransport):
                 door_open_pause_enabled=door_open_pause_enabled,
                 metadata=metadata if metadata else None,
             )
+        else:
+            # skip_precheck 只跳过检查项；状态机要求 standby→precheck→preprinting，
+            # 若不进入 precheck，SDCARD_PRINT_FILE 会因 standby→preprinting 非法而失败。
+            try:
+                await self.run_gcode("SET_PRINT_PRECHECK_STATE")
+            except Exception as e:
+                logging.warning(
+                    "Precheck skipped: failed to set print state to precheck: %s", e
+                )
 
         # Escape existing double quotes in the file name
         filename_only = filename_only.replace("\"", "\\\"")
@@ -724,12 +733,12 @@ class KlippyAPI(APITransport):
             return name.strip().lower()
 
         def _names_compatible(expected: str, loaded: str) -> bool:
-            """机上材料名是需求名的子集（含相等）即通过，如 now=pla、need=pla-x。"""
+            """双边子集：任一方是另一方的子串（含相等）即通过，如 pla↔pla-x。"""
             e = _normalize(expected)
             l = _normalize(loaded)
             if not e or not l:
                 return False
-            return l in e
+            return l in e or e in l
 
         mismatches: List[Dict[str, str]] = []
         try:
@@ -742,7 +751,8 @@ class KlippyAPI(APITransport):
                 ).strip()
                 if _names_compatible(expected, loaded):
                     continue
-                loaded_display = loaded if loaded else "none"
+                # 未装载用中性占位符，避免在非英文界面里混入 "none"
+                loaded_display = loaded if loaded else "--"
                 mismatches.append(
                     {
                         "channel": spool_id,
@@ -763,8 +773,14 @@ class KlippyAPI(APITransport):
             logging.info("Material match precheck: all required channels match")
             return
 
-        # message 稳定供 error_indexer / xlsx 匹配；通道明细只放 data
-        msg = "Material mismatch"
+        # message 前缀稳定供 error_indexer / xlsx 匹配（模板 "Material mismatch: %1"），
+        # 冒号后的通道明细作为 %1 捕获，由 error_info.xlsx 的多语言描述模板渲染。
+        # 通道用 F/P1/P2 代号而非英文名，避免在非英文界面里混入英文。
+        detail = ", ".join(
+            f"{item['channel']}: {item['loaded']} vs {item['expected']}"
+            for item in mismatches
+        )
+        msg = f"Material mismatch: {detail}"
         logging.warning(
             "Material match precheck failed: %s mismatches=%s", msg, mismatches
         )
