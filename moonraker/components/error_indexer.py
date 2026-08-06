@@ -87,6 +87,11 @@ class ErrorIndexer:
         self.server.register_event_handler(
             "ai_detection:detection_result", self._handle_ai_detection_result
         )
+        # 5) 捕获舱内温度超限报警（由 enclosure_temp_monitor 组件发送）
+        self.server.register_event_handler(
+            "enclosure_temp_monitor:alarm",
+            self._handle_enclosure_temp_alarm,
+        )
 
 
     # 注册 WebSocket 通知
@@ -548,9 +553,12 @@ class ErrorIndexer:
                 original_response,
                 code=code,
                 placeholder_values=groups,
+                skip_dedup=True,
             )
         else:
-            self._process_error(message, original_response, None)
+            self._process_error(
+                message, original_response, None, skip_dedup=True
+            )
 
     def _handle_ai_detection_result(self, payload: Dict[str, Any]) -> None:
         """处理来自 ai_detection 组件的检测结果事件。
@@ -604,6 +612,50 @@ class ErrorIndexer:
                 error_db=self.ai_error_db,
                 extra_payload=image_payload,
             )
+
+    def _handle_enclosure_temp_alarm(self, payload: Dict[str, Any]) -> None:
+        """处理来自 enclosure_temp_monitor 的舱内超温报警。
+
+        payload 示例:
+            {
+                "message": "Chamber temperature too high: 41.2C (limit 40.0C for PLA)",
+                "temperature": 41.2,
+                "limit": 40.0,
+                "material": "PLA",
+                "sensor": "temperature_sensor toolhead_temp",
+                "paused": true
+            }
+        统一转换为 error_indexer:error_detected，供上位机展示。
+        """
+        if not isinstance(payload, dict):
+            return
+
+        message = (payload.get("message") or "").strip()
+        if not message:
+            return
+
+        material = payload.get("material") or ""
+        temperature = payload.get("temperature")
+        limit = payload.get("limit")
+        sensor = payload.get("sensor") or ""
+        paused = payload.get("paused")
+        original_response = (
+            f"enclosure_temp_monitor:alarm "
+            f"material={material}, temperature={temperature}, "
+            f"limit={limit}, sensor={sensor}, paused={paused}, "
+            f"message={message}"
+        )
+        match_result = self._match_error_code(message)
+        if match_result:
+            code, groups = match_result
+            self._process_error(
+                message,
+                original_response,
+                code=code,
+                placeholder_values=groups,
+            )
+        else:
+            self._process_error(message, original_response, None)
 
     def _resolve_ai_image_type(
         self, scenario: str, detection_type: str
@@ -707,6 +759,7 @@ class ErrorIndexer:
         placeholder_values: Optional[Tuple[str, ...]] = None,
         error_db: Optional[Dict[str, Dict[str, Any]]] = None,
         extra_payload: Optional[Dict[str, Any]] = None,
+        skip_dedup: bool = False,
     ) -> None:
         """Process detected error."""
         db = error_db or self.error_db
@@ -717,7 +770,8 @@ class ErrorIndexer:
                 code, placeholder_values = match_result
         if not code:
             code = "UNKNOWN"
-        if self._is_duplicate_error(error_msg):
+        # 预检失败与用户点击 1:1，不能按短窗口去重，否则再次点打印不弹窗
+        if not skip_dedup and self._is_duplicate_error(error_msg):
             logging.debug(
                 "Error Indexer: Suppressed duplicate error within %.1fs: %s",
                 self.dedup_interval, error_msg

@@ -254,6 +254,14 @@ class MaterialManager:
         else:
             raise self.server.error(f"Material {material_id} not found", 404)
 
+    def get_spool_material_name(self, spool_id: str) -> str:
+        """返回指定通道（F/P1/P2）当前装载材料的名称，未装载或材料库缺失时返回空串。"""
+        spool = self.spools.get("spools", {}).get(spool_id, {})
+        material_id = spool.get("material_id", "")
+        if not material_id:
+            return ""
+        return str(self.materials.get(material_id, {}).get("name", ""))
+
     async def _handle_get_spools_status(self, web_request):
         """获取料卷状态"""
         result = {}
