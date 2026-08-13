@@ -662,28 +662,30 @@ class Timelapse:
             else:
                 fps = self.config['output_framerate']
 
-            # apply rotation
-            filterParam = ""
+            # apply rotation / flip, then force even WxH for libx264 + yuv420p
+            filters = []
             if self.config['rotation'] == 90 and self.config['flip_y']:
-                filterParam = " -vf 'transpose=3'"
+                filters.append("transpose=3")
             elif self.config['rotation'] == 90:
-                filterParam = " -vf 'transpose=1'"
+                filters.append("transpose=1")
             elif self.config['rotation'] == 180:
-                filterParam = " -vf 'hflip,vflip'"
+                filters.append("hflip,vflip")
             elif self.config['rotation'] == 270:
-                filterParam = " -vf 'transpose=2'"
+                filters.append("transpose=2")
             elif self.config['rotation'] == 270 and self.config['flip_y']:
-                filterParam = " -vf 'transpose=0'"
+                filters.append("transpose=0")
             elif self.config['rotation'] > 0:
                 pi = 3.141592653589793
                 rot = str(self.config['rotation']*(pi/180))
-                filterParam = " -vf 'rotate=" + rot + "'"
+                filters.append("rotate=" + rot)
             elif self.config['flip_x'] and self.config['flip_y']:
-                filterParam = " -vf 'hflip,vflip'"
+                filters.append("hflip,vflip")
             elif self.config['flip_x']:
-                filterParam = " -vf 'hflip'"
+                filters.append("hflip")
             elif self.config['flip_y']:
-                filterParam = " -vf 'vflip'"
+                filters.append("vflip")
+            filters.append("scale=trunc(iw/2)*2:trunc(ih/2)*2")
+            filterParam = " -vf '" + ",".join(filters) + "'"
 
             # build shell command
             cmd = self.ffmpeg_binary_path \
