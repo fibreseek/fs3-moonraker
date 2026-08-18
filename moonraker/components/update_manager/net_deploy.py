@@ -691,12 +691,15 @@ class NetDeploy(AppDeploy):
             client = self.cmd_helper.get_http_client()
             if self.type == AppType.OTA_ZIP:
                 staged = tempdir.joinpath(self._ota_staged_download_name(dl_url))
+                # fibrepack is typically 250MB+; printer Wi-Fi often needs
+                # well over the http_client default of 180s to finish.
                 await client.download_file(
                     dl_url,
                     content_type or "application/octet-stream",
                     staged,
                     size,
                     self.cmd_helper.on_download_progress,
+                    request_timeout=1800.,
                 )
                 zip_path = tempdir.joinpath(f"{self.name}.zip")
                 await event_loop.run_in_thread(
