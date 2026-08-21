@@ -19,6 +19,12 @@ check_interval: 5.0
 pause_on_alarm: True
 # 温度回落后清除报警的滞后（°C）
 hysteresis: 2.0
+# 触发侧死区：平滑温度需超过 limit + trigger_margin 才开始计超限
+trigger_margin: 0.5
+# 持续超限多少秒后才触发报警
+breach_duration: 30.0
+# 滑动平均窗口（采样次数，与 check_interval 相乘为时间跨度）
+smooth_window: 6
 # 同一报警通知的最小间隔（秒）
 alarm_cooldown: 60.0
 # 是否同时参考当前打印文件元数据中的 filament_type
@@ -41,12 +47,28 @@ max_temp_PETG: 45
 2. 当前材料来源：
    - `material_manager` 中 `spool_ids` 指定料卷的 `polymer_type`
    - 可选：当前 gcode 元数据 `filament_type`
-3. 仅当活跃材料属于 `monitored_materials` 且传感器温度高于对应 `max_temp_*` 时触发。
-4. 触发后：
+3. 仅当活跃材料属于 `monitored_materials` 且**平滑温度**高于 `max_temp_* + trigger_margin` 时进入超限候选。
+4. 超限候选需**持续** `breach_duration` 秒后才真正触发（中途回落则计时重置）。
+5. 触发后：
    - 发送事件 `enclosure_temp_monitor:alarm`
    - 由 `error_indexer` 匹配错误码（`10076`）并推送 `notify_error_indexer_error_detected`
    - 若 `pause_on_alarm: True`，调用暂停打印
-5. 温度降至 `limit - hysteresis` 以下后清除内部报警状态（不走 error_indexer）。
+6. 平滑温度降至 `limit - hysteresis` 以下后清除内部报警状态（不走 error_indexer）。
+
+### 防抖机制
+
+```
+原始读数 → [smooth_window 滑动平均] → [limit + trigger_margin 触发阈值]
+         → [breach_duration 持续确认] → 报警
+         → [limit - hysteresis] → 清除
+```
+
+| 参数 | 默认值 | 作用 |
+|------|--------|------|
+| `smooth_window` | 6 | 最近 N 次采样取平均，滤单点噪声 |
+| `trigger_margin` | 0.5°C | 触发侧死区，避免在 limit 边界抖动 |
+| `breach_duration` | 30s | 持续超限才报警，滤短暂升温 |
+| `hysteresis` | 2.0°C | 清除侧滞后，避免报警/清除来回跳 |
 
 ## HTTP / JSON-RPC
 
@@ -64,6 +86,7 @@ max_temp_PETG: 45
   "monitoring": true,
   "sensor": "temperature_sensor toolhead_temp",
   "temperature": 38.2,
+  "smoothed_temperature": 37.8,
   "material_limits": {"PLA": 40.0, "PLA_CF": 40.0, "PETG": 45.0},
   "active_materials": ["PLA"],
   "alarm_active": false,
@@ -71,7 +94,13 @@ max_temp_PETG: 45
   "last_alarm_temp": null,
   "pause_on_alarm": true,
   "check_interval": 5.0,
-  "hysteresis": 2.0
+  "hysteresis": 2.0,
+  "trigger_margin": 0.5,
+  "breach_duration": 30.0,
+  "smooth_window": 6,
+  "breach_pending": false,
+  "breach_elapsed": 0.0,
+  "breach_pending_material": null
 }
 ```
 

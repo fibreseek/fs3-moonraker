@@ -11,6 +11,7 @@ from __future__ import annotations
 import logging
 import re
 import time
+from collections import deque
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -58,6 +59,13 @@ class EnclosureTempMonitor:
         )
         self.pause_on_alarm = config.getboolean("pause_on_alarm", True)
         self.hysteresis = config.getfloat("hysteresis", 2.0, minval=0.0)
+        self.trigger_margin = config.getfloat(
+            "trigger_margin", 0.5, minval=0.0
+        )
+        self.breach_duration = config.getfloat(
+            "breach_duration", 30.0, minval=0.0
+        )
+        self.smooth_window = config.getint("smooth_window", 6, minval=1)
         self.alarm_cooldown = config.getfloat(
             "alarm_cooldown", 60.0, minval=0.0
         )
@@ -90,6 +98,10 @@ class EnclosureTempMonitor:
                 self.material_limits[key] = limit
 
         self._chamber_temp: Optional[float] = None
+        self._smoothed_temp: Optional[float] = None
+        self._temp_history: deque[float] = deque(maxlen=self.smooth_window)
+        self._breach_since: Optional[float] = None
+        self._breach_pending_polymer: Optional[str] = None
         self._alarm_active = False
         self._last_alarm_time = 0.0
         self._last_alarm_material: Optional[str] = None
@@ -126,11 +138,15 @@ class EnclosureTempMonitor:
 
         logging.info(
             "EnclosureTempMonitor: loaded (enable=%s, sensor=%s, "
-            "limits=%s, interval=%.1fs)",
+            "limits=%s, interval=%.1fs, smooth_window=%d, "
+            "trigger_margin=%.1f, breach_duration=%.1fs)",
             self.enable,
             self.sensor,
             self.material_limits,
             self.check_interval,
+            self.smooth_window,
+            self.trigger_margin,
+            self.breach_duration,
         )
 
     async def component_init(self) -> None:
@@ -174,6 +190,9 @@ class EnclosureTempMonitor:
     def _handle_klippy_disconnect(self) -> None:
         self._stop_monitor()
         self._chamber_temp = None
+        self._smoothed_temp = None
+        self._reset_breach_state()
+        self._temp_history.clear()
         self._alarm_active = False
 
     async def _on_job_state_changed(
@@ -194,6 +213,9 @@ class EnclosureTempMonitor:
         ):
             self._stop_monitor()
             self._alarm_active = False
+            self._reset_breach_state()
+            self._temp_history.clear()
+            self._smoothed_temp = None
         elif job_event == JobEvent.PAUSED:
             # Keep timer running so we can clear alarm when temp drops,
             # but do not re-pause while already paused.
@@ -212,6 +234,9 @@ class EnclosureTempMonitor:
         if self._monitoring or not self.enable:
             return
         self._monitoring = True
+        self._reset_breach_state()
+        self._temp_history.clear()
+        self._smoothed_temp = None
         if self._timer is not None:
             self._timer.start(delay=self.check_interval)
         logging.info("EnclosureTempMonitor: monitoring started")
@@ -223,6 +248,21 @@ class EnclosureTempMonitor:
         if self._timer is not None:
             self._timer.stop()
         logging.info("EnclosureTempMonitor: monitoring stopped")
+
+    def _reset_breach_state(self) -> None:
+        self._breach_since = None
+        self._breach_pending_polymer = None
+
+    def _update_smoothed_temp(self, temp: float) -> float:
+        self._temp_history.append(temp)
+        smoothed = sum(self._temp_history) / len(self._temp_history)
+        self._smoothed_temp = smoothed
+        return smoothed
+
+    def _get_breach_elapsed(self) -> float:
+        if self._breach_since is None:
+            return 0.0
+        return max(0.0, time.time() - self._breach_since)
 
     def _is_printing(self) -> bool:
         try:
@@ -243,13 +283,16 @@ class EnclosureTempMonitor:
         return eventtime + self.check_interval
 
     async def _evaluate(self) -> None:
-        temp = await self._get_chamber_temp()
-        if temp is None:
+        raw_temp = await self._get_chamber_temp()
+        if raw_temp is None:
             return
+
+        temp = self._update_smoothed_temp(raw_temp)
 
         active = self._get_active_polymers()
         if not active:
             # No monitored material in use; clear any stale alarm quietly
+            self._reset_breach_state()
             if self._alarm_active:
                 await self._clear_alarm(temp, silent=True)
             return
@@ -260,16 +303,41 @@ class EnclosureTempMonitor:
             limit = self.material_limits.get(polymer)
             if limit is None:
                 continue
-            if temp > limit:
+            trigger_threshold = limit + self.trigger_margin
+            if temp > trigger_threshold:
                 if breach is None or limit < breach[1]:
                     breach = (polymer, limit)
 
         if breach is not None:
             polymer, limit = breach
-            await self._trigger_alarm(temp, polymer, limit)
+            if self._alarm_active:
+                await self._trigger_alarm(temp, polymer, limit)
+                return
+
+            now = time.time()
+            if (
+                self._breach_since is None
+                or self._breach_pending_polymer != polymer
+            ):
+                self._breach_since = now
+                self._breach_pending_polymer = polymer
+                logging.debug(
+                    "EnclosureTempMonitor: breach pending for %s "
+                    "(smoothed=%.1f, limit=%.1f, margin=%.1f)",
+                    polymer,
+                    temp,
+                    limit,
+                    self.trigger_margin,
+                )
+
+            elapsed = now - self._breach_since
+            if elapsed >= self.breach_duration:
+                await self._trigger_alarm(temp, polymer, limit)
             return
 
-        # Below all limits — clear with hysteresis
+        self._reset_breach_state()
+
+        # Below trigger thresholds — clear with hysteresis on smoothed temp
         if self._alarm_active and self._last_alarm_material:
             limit = self.material_limits.get(
                 self._last_alarm_material, 0.0
@@ -442,11 +510,15 @@ class EnclosureTempMonitor:
     async def _handle_status_request(
         self, web_request: WebRequest
     ) -> Dict[str, Any]:
+        breach_pending = (
+            self._breach_since is not None and not self._alarm_active
+        )
         return {
             "enable": self.enable,
             "monitoring": self._monitoring,
             "sensor": self.sensor,
             "temperature": self._chamber_temp,
+            "smoothed_temperature": self._smoothed_temp,
             "material_limits": dict(self.material_limits),
             "active_materials": sorted(self._get_active_polymers()),
             "alarm_active": self._alarm_active,
@@ -455,6 +527,12 @@ class EnclosureTempMonitor:
             "pause_on_alarm": self.pause_on_alarm,
             "check_interval": self.check_interval,
             "hysteresis": self.hysteresis,
+            "trigger_margin": self.trigger_margin,
+            "breach_duration": self.breach_duration,
+            "smooth_window": self.smooth_window,
+            "breach_pending": breach_pending,
+            "breach_elapsed": round(self._get_breach_elapsed(), 1),
+            "breach_pending_material": self._breach_pending_polymer,
         }
 
     async def close(self) -> None:
