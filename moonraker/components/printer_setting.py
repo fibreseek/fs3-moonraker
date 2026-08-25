@@ -153,6 +153,30 @@ class PrinterSetting:
                     ):
                         # machine_id/firmware_version/serial_num/machine_type/fibretouch_system_verison are not settable
                         continue
+                    elif key == "deviceActivationTime":
+                        # 设备激活时间只允许首次写入非空值，忽略清空或改写
+                        existing = self._setting_cache[namespace].get(key, None)
+                        existing_str = existing.strip() if isinstance(existing, str) else (
+                            str(existing).strip() if existing is not None else ""
+                        )
+                        incoming_str = value.strip() if isinstance(value, str) else (
+                            str(value).strip() if value is not None else ""
+                        )
+                        if existing_str:
+                            logging.info(
+                                "Ignore overwrite of fibretouch.deviceActivationTime"
+                            )
+                            continue
+                        if not incoming_str:
+                            logging.info(
+                                "Ignore empty fibretouch.deviceActivationTime"
+                            )
+                            continue
+                        await self.database.insert_item("fibretouch", key, incoming_str)
+                        new_value = await self.database.get_item("fibretouch", key)
+                        updated_params[key] = new_value
+                        if new_value != self._setting_cache[namespace].get(key, None):
+                            self._queue_setting_change(namespace, {key: new_value})
                     else:
                         # 其他参数直接设置到数据库中
                         if value != self._setting_cache[namespace].get(key, None):
